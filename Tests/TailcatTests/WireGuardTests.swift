@@ -1,0 +1,168 @@
+import Foundation
+import XCTest
+@testable import Tailcat
+
+final class WireGuardTests: XCTestCase {
+    private let now = Date(timeIntervalSince1970: 1_700_000_000)
+    private func peers(pskA: Data = Data(repeating: 0, count: 32), pskB: Data = Data(repeating: 0, count: 32)) throws -> (WireGuard, WireGuard) {
+        let a = Data(0..<32), b = Data(32..<64)
+        return (try WireGuard(privateKey: a, peerPublicKey: TailcatCrypto.publicKey(privateKey: b), presharedKey: pskA),
+                try WireGuard(privateKey: b, peerPublicKey: TailcatCrypto.publicKey(privateKey: a), presharedKey: pskB))
+    }
+    private func ipPacket(_ value: UInt8 = 42) -> Data {
+        var bytes = [UInt8](repeating: 0, count: 23)
+        bytes[0]=0x45; bytes[3]=23; bytes[8]=64; bytes[9]=17
+        bytes[12]=100; bytes[16]=100; bytes[20]=value
+        return Data(bytes)
+    }
+    private func remac(_ packet: Data, recipientPrivateKey: Data) throws -> Data {
+        let key=TailcatCrypto.blake2s(Data("mac1----".utf8) + (try TailcatCrypto.publicKey(privateKey: recipientPrivateKey)))
+        let body=Data(packet.dropLast(32))
+        return body + TailcatCrypto.blake2s(body,key: key,digestLength: 16) + packet.suffix(16)
+    }
+    private func establish(_ a: inout WireGuard, _ b: inout WireGuard, now: Date) throws {
+        let initiation = try a.initiate(now: now)
+        XCTAssertEqual(initiation.count,148)
+        let response = try XCTUnwrap(b.receive(initiation, now: now).response)
+        XCTAssertEqual(response.count,92)
+        let accepted = try a.receive(response, now: now)
+        XCTAssertTrue(accepted.handshakeCompleted)
+        let confirmation = try XCTUnwrap(accepted.response)
+        XCTAssertEqual(confirmation.count,32)
+        let confirmed = try b.receive(confirmation, now: now)
+        XCTAssertTrue(confirmed.handshakeCompleted)
+        XCTAssertNil(confirmed.plaintext)
+        XCTAssertTrue(a.isEstablished); XCTAssertTrue(b.isEstablished)
+    }
+
+    func testHandshakeAndBidirectionalPaddedTransport() throws {
+        var (a,b) = try peers()
+        XCTAssertThrowsError(try a.encrypt(ipPacket(), now: now))
+        try establish(&a,&b,now: now)
+        let packet = try a.encrypt(ipPacket(),now: now)
+        XCTAssertEqual(packet.count,64)
+        XCTAssertEqual(try b.receive(packet,now: now).plaintext,ipPacket())
+        XCTAssertEqual(try a.receive(b.encrypt(ipPacket(99),now: now),now: now).plaintext,ipPacket(99))
+        XCTAssertThrowsError(try b.receive(packet,now: now)) { XCTAssertEqual($0 as? WireGuard.Error,.replay) }
+        XCTAssertFalse(a.needsRekey(now: now.addingTimeInterval(119)))
+        XCTAssertTrue(a.needsRekey(now: now.addingTimeInterval(120)))
+        XCTAssertThrowsError(try a.encrypt(ipPacket(),now: now.addingTimeInterval(180)))
+        var ipv6 = Data(repeating: 0,count: 43); ipv6[0]=0x60; ipv6[5]=3; ipv6[40]=77
+        XCTAssertEqual(try b.receive(a.encrypt(ipv6,now: now),now: now).plaintext,ipv6)
+    }
+
+    func testAuthenticationFailureDoesNotConsumeCounter() throws {
+        var (a,b) = try peers(); try establish(&a,&b,now: now)
+        let first = try a.encrypt(ipPacket(1),now: now), second = try a.encrypt(ipPacket(2),now: now)
+        var corrupted = first; corrupted[20] ^= 1
+        XCTAssertThrowsError(try b.receive(corrupted,now: now))
+        XCTAssertEqual(try b.receive(second,now: now).plaintext,ipPacket(2))
+        XCTAssertEqual(try b.receive(first,now: now).plaintext,ipPacket(1))
+        XCTAssertThrowsError(try b.receive(first,now: now))
+        var index = first; index[4] ^= 1
+        XCTAssertThrowsError(try b.receive(index,now: now))
+        XCTAssertThrowsError(try b.receive(first,now: now.addingTimeInterval(180)))
+    }
+
+    func testHandshakeReplaysAndTampering() throws {
+        var (a,b) = try peers()
+        let initiation = try a.initiate(now: now)
+        var tampered = initiation; tampered[40] ^= 1
+        XCTAssertThrowsError(try b.receive(tampered,now: now))
+        // MAC1 uses a public key; forged MAC1 must still fail Noise AEAD.
+        tampered = try remac(tampered,recipientPrivateKey: Data(32..<64))
+        XCTAssertThrowsError(try b.receive(tampered,now: now))
+        let response = try XCTUnwrap(b.receive(initiation,now: now).response)
+        XCTAssertThrowsError(try b.receive(initiation,now: now.addingTimeInterval(1))) { XCTAssertEqual($0 as? WireGuard.Error,.replay) }
+        tampered=response; tampered[44] ^= 1
+        tampered = try remac(tampered,recipientPrivateKey: Data(0..<32))
+        XCTAssertThrowsError(try a.receive(tampered,now: now))
+        _ = try a.receive(response,now: now)
+        XCTAssertThrowsError(try a.receive(response,now: now))
+        for size in [0,1,3,4,31,91,147] { XCTAssertThrowsError(try b.receive(Data(repeating: 0,count: size),now: now)) }
+    }
+
+    func testIndependentNoiseInitiationVectorAndPeerIdentity() throws {
+        // Generated by independent Python hashlib + cryptography X25519/AEAD.
+        let text = """
+            01000000efbeadde79a631eede1bf9c98f12032cdeadd0e7a079398fc786b88cc846ec89af85a51a
+            f0225eb421886af8f54fb31289d49dcd82b0f6f3279d40d7cff913fece0c64ad226eef3320755b39
+            3b72f16842c8d7ee78a74e937e3f2a828ff4ecc11547a9c7d1ee1b22fedf3178ecbaddb30932c66
+            94d28366d80c9b4730611031e00000000000000000000000000000000
+            """.filter { !$0.isWhitespace }
+        let characters=Array(text)
+        let packet=Data(stride(from: 0,to: characters.count,by: 2).map { UInt8(String(characters[$0...$0+1]),radix: 16)! })
+        var (_,b)=try peers()
+        XCTAssertEqual(WireGuard.packetType(try XCTUnwrap(b.receive(packet,now: now).response)),2)
+        var unknown=try WireGuard(privateKey: Data(64..<96),peerPublicKey: TailcatCrypto.publicKey(privateKey: Data(32..<64)))
+        XCTAssertThrowsError(try b.receive(unknown.initiate(now: now.addingTimeInterval(1)),now: now.addingTimeInterval(1))) {
+            XCTAssertEqual($0 as? WireGuard.Error,.wrongPeer)
+        }
+    }
+
+    func testPresharedKeyMismatch() throws {
+        var (a,b) = try peers(pskA: Data(repeating: 7,count: 32))
+        let response = try XCTUnwrap(b.receive(a.initiate(now: now),now: now).response)
+        XCTAssertThrowsError(try a.receive(response,now: now))
+        XCTAssertFalse(a.isEstablished); XCTAssertFalse(b.isEstablished)
+        var (c,d) = try peers(pskA: Data(repeating: 7,count: 32), pskB: Data(repeating: 7,count: 32))
+        try establish(&c,&d,now: now)
+    }
+
+    func testRekeyRetainsPreviousTransportAndWaitsForConfirmation() throws {
+        var (a,b) = try peers(); try establish(&a,&b,now: now)
+        let oldA = try a.encrypt(ipPacket(3),now: now), oldB = try b.encrypt(ipPacket(4),now: now)
+        let later=now.addingTimeInterval(121)
+        let response = try XCTUnwrap(b.receive(a.initiate(now: later),now: later).response)
+        // Responder continues transmitting on current until authenticated data.
+        XCTAssertEqual(try a.receive(b.encrypt(ipPacket(5),now: later),now: later).plaintext,ipPacket(5))
+        let confirmation = try XCTUnwrap(a.receive(response,now: later).response)
+        XCTAssertEqual(try a.receive(oldB,now: later).plaintext,ipPacket(4))
+        _ = try b.receive(confirmation,now: later)
+        XCTAssertEqual(try b.receive(oldA,now: later).plaintext,ipPacket(3))
+        XCTAssertEqual(try a.receive(b.encrypt(ipPacket(6),now: later),now: later).plaintext,ipPacket(6))
+        XCTAssertThrowsError(try a.receive(oldB,now: later))
+    }
+
+    func testCookieChallengeAndSourceBinding() throws {
+        var (a,b) = try peers()
+        let source = Data([100,64,0,1,0x12,0x34])
+        let initiation=try a.initiate(now: now)
+        let challenge=try XCTUnwrap(b.receive(initiation,now: now,source: source,requireCookie: true).response)
+        XCTAssertEqual(WireGuard.packetType(challenge),3)
+        var tampered=challenge; tampered[40] ^= 1
+        XCTAssertThrowsError(try a.receive(tampered,now: now))
+        let retried=try XCTUnwrap(a.receive(challenge,now: now).response)
+        XCTAssertNotEqual(retried.suffix(16),Data(repeating: 0,count: 16))
+        let wrongSource=try XCTUnwrap(b.receive(retried,now: now,source: Data([9]),requireCookie: true).response)
+        XCTAssertEqual(WireGuard.packetType(wrongSource),3)
+        let response=try XCTUnwrap(b.receive(retried,now: now,source: source,requireCookie: true).response)
+        XCTAssertEqual(WireGuard.packetType(response),2)
+        let confirmation=try XCTUnwrap(a.receive(response,now: now).response)
+        XCTAssertTrue(try b.receive(confirmation,now: now).handshakeCompleted)
+    }
+
+    func testSimultaneousInitiationsPreserveBothReceiveKeypairs() throws {
+        var (a,b) = try peers()
+        let initiationA = try a.initiate(now: now), initiationB = try b.initiate(now: now)
+        let responseB = try XCTUnwrap(b.receive(initiationA,now: now).response)
+        let responseA = try XCTUnwrap(a.receive(initiationB,now: now).response)
+        let confirmationA = try XCTUnwrap(a.receive(responseB,now: now).response)
+        let confirmationB = try XCTUnwrap(b.receive(responseA,now: now).response)
+        _ = try a.receive(confirmationB,now: now)
+        _ = try b.receive(confirmationA,now: now)
+        XCTAssertEqual(try a.receive(b.encrypt(ipPacket(8),now: now),now: now).plaintext,ipPacket(8))
+        XCTAssertEqual(try b.receive(a.encrypt(ipPacket(9),now: now),now: now).plaintext,ipPacket(9))
+    }
+
+    func testReplayWindowBoundariesAndLargeJumps() {
+        var window=WireGuard.ReplayWindow()
+        XCTAssertTrue(window.accept(0)); XCTAssertTrue(window.accept(1)); XCTAssertTrue(window.accept(63))
+        XCTAssertTrue(window.accept(8192))
+        XCTAssertFalse(window.accept(0)); XCTAssertFalse(window.accept(1)); XCTAssertFalse(window.accept(63))
+        XCTAssertTrue(window.accept(2)); XCTAssertFalse(window.accept(2))
+        XCTAssertTrue(window.accept(16384)); XCTAssertFalse(window.accept(8192)); XCTAssertTrue(window.accept(8193))
+        XCTAssertTrue(window.accept(1_000_000)); XCTAssertFalse(window.accept(16384))
+        XCTAssertFalse(window.accept(UInt64.max-8192)); XCTAssertFalse(window.accept(UInt64.max))
+    }
+}
