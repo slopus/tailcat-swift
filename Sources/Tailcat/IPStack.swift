@@ -344,6 +344,9 @@ internal actor IPStack {
             return
         }
         if flags & 0x04 != 0 {
+            // Preserve buffered bytes and orderly EOF after both FINs complete;
+            // a peer that discarded its closed flow may reset later window ACKs.
+            if state.readEOF && state.finAcknowledged { return }
             // RFC 5961: only an exact in-window RST can terminate a stream.
             if sequence == state.receiveNext { fail(id, error: TailcatTransportError.connectionReset) }
             else { sendACK(state) }

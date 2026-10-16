@@ -27,6 +27,7 @@ private actor PacketLink {
     private var sawFIN = false
     private(set) var sawZeroWindow = false
     private(set) var drops = 0
+    private(set) var deliveredResets = 0
 
     init(faults: Faults = Faults()) { self.faults = faults }
 
@@ -98,6 +99,7 @@ private actor PacketLink {
             if count > 0 && faults.duplicate { await target.receive(data) }
         }
         await target.receive(data)
+        if data.count >= 60 && data[6] == 6 && data[53] & 0x04 != 0 { deliveredResets += 1 }
     }
 }
 
@@ -196,6 +198,40 @@ final class IPStackTests: XCTestCase {
             try await writer.value
             let count = await link.drops
             XCTAssertEqual(count, 5)
+        }
+        await a.close(); await b.close()
+    }
+
+    func testLateResetAfterBothFINsPreservesBufferedTailAndEOF() async throws {
+        let (a, b, link) = await pair()
+        let listener = try await b.listen(port: 86)
+        let peer = addressB
+        let response = Data((0..<4096).map { UInt8(truncatingIfNeeded: $0 * 19) })
+        try await deadline {
+            let client = try await a.connect(peer: peer, port: 86)
+            let server = try await listener.accept()
+            try await client.write(Data([1, 2, 3]))
+            try await client.closeWrite()
+            let request = try await self.drain(server)
+            XCTAssertEqual(request, Data([1, 2, 3]))
+            try await server.write(response)
+            try await server.closeWrite()
+            // Forget the peer's fully closed flow while its response remains
+            // buffered at the client. Reading reopens the receive window and
+            // elicits an exact-sequence RST from the unknown-flow handler.
+            await server.abort()
+            let prefix = try await client.read(maximumBytes: 1024)
+            XCTAssertEqual(prefix, Data(response.prefix(1024)))
+            for _ in 0..<100 {
+                if await link.deliveredResets > 0 { break }
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            let resets = await link.deliveredResets
+            XCTAssertEqual(resets, 1)
+            let tail = try await client.read()
+            XCTAssertEqual(tail, Data(response.dropFirst(1024)))
+            let eof = try await client.read()
+            XCTAssertTrue(eof.isEmpty)
         }
         await a.close(); await b.close()
     }
