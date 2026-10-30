@@ -63,12 +63,7 @@ final class UDPChannel: @unchecked Sendable {
     private var closed = false // Only accessed on queue.
 
     init(receive: @escaping @Sendable (Data, DiscoveryEndpoint) -> Void) throws {
-        #if canImport(Darwin)
-        let fd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP)
-        #else
-        let fd = socket(AF_INET6, Int32(SOCK_DGRAM.rawValue), Int32(IPPROTO_UDP))
-        #endif
-        guard fd >= 0 else { throw TransportError.connectionFailed("UDP socket: \(errno)") }
+        let fd = try Self.makeSocket()
         descriptor = fd
         var disabled: Int32 = 0
         guard setsockopt(fd, Int32(IPPROTO_IPV6), IPV6_V6ONLY, &disabled, socklen_t(MemoryLayout<Int32>.size)) == 0,
@@ -108,6 +103,26 @@ final class UDPChannel: @unchecked Sendable {
         }
         source.setCancelHandler { Self.closeDescriptor(fd) }
         source.resume()
+    }
+
+    static func makeSocket() throws -> Int32 {
+        #if canImport(Darwin)
+        let fd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP)
+        #else
+        let fd = socket(AF_INET6, Int32(SOCK_DGRAM.rawValue), Int32(IPPROTO_UDP))
+        #endif
+        guard fd >= 0 else { throw TransportError.connectionFailed("UDP socket: \(errno)") }
+        #if canImport(Darwin)
+        // iOS can invalidate UDP sockets while the app is suspended. A write
+        // after resume must throw EPIPE, not terminate the process with SIGPIPE.
+        var enabled: Int32 = 1
+        guard setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled, socklen_t(MemoryLayout<Int32>.size)) == 0 else {
+            let error = errno
+            closeDescriptor(fd)
+            throw TransportError.connectionFailed("UDP suppress SIGPIPE: \(error)")
+        }
+        #endif
+        return fd
     }
 
     deinit { source.cancel() }
