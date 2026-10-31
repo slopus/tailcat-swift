@@ -28,10 +28,16 @@ private actor PacketLink {
     private(set) var sawZeroWindow = false
     private(set) var drops = 0
     private(set) var deliveredResets = 0
+    private(set) var deliveredACKs = 0
+    private var lastClientFIN: Data?
 
     init(faults: Faults = Faults()) { self.faults = faults }
 
     func attach(_ a: IPStack, _ b: IPStack) { self.a = a; self.b = b }
+
+    func replayClientFIN() async {
+        if let packet = lastClientFIN { await b?.receive(packet) }
+    }
 
     func send(_ data: Data, fromA: Bool) async {
         guard let target = fromA ? b : a else { return }
@@ -50,7 +56,7 @@ private actor PacketLink {
                 await target.rejectTCP(peer: Data(data[8..<24]), body: body)
             }
             if data[54] == 0 && data[55] == 0 { sawZeroWindow = true }
-            if fromA && flags & 1 != 0 { sawFIN = true }
+            if fromA && flags & 1 != 0 { sawFIN = true; lastClientFIN = data }
             if !fromA && flags == 0x10 && sawZeroWindow &&
                 (data[54] != 0 || data[55] != 0) && faults.dropReopenWindow {
                 faults.dropReopenWindow = false; drops += 1; return
@@ -100,6 +106,7 @@ private actor PacketLink {
         }
         await target.receive(data)
         if data.count >= 60 && data[6] == 6 && data[53] & 0x04 != 0 { deliveredResets += 1 }
+        if data.count >= 60 && data[6] == 6 && data[53] == 0x10 { deliveredACKs += 1 }
     }
 }
 
@@ -176,6 +183,109 @@ final class IPStackTests: XCTestCase {
             let eof = try await client.read()
             XCTAssertTrue(eof.isEmpty)
         }
+        await a.close(); await b.close()
+    }
+
+    func testThousandsOfShortRequestsKeepEventStreamAlive() async throws {
+        let (a, b, _) = await pair()
+        let listener = try await b.listen(port: 80)
+        let peer = addressB
+        try await deadline {
+            let events = try await a.connect(peer: peer, port: 80)
+            let eventServer = try await listener.accept()
+            let ready = Data("event: ready\ndata: {}\n\n".utf8)
+            try await eventServer.write(ready)
+            let receivedReady = try await events.read()
+            XCTAssertEqual(receivedReady, ready)
+            var firstPort: UInt16?
+            var lastPort: UInt16 = 0
+            for index in 0..<1300 {
+                let client = try await a.connect(peer: peer, port: 80)
+                let server = try await listener.accept()
+                firstPort = firstPort ?? client.localPort
+                lastPort = client.localPort
+                let request = Data("GET /kv/entry?key=\(index) HTTP/1.1\r\nHost: fixture\r\nConnection: close\r\n\r\n".utf8)
+                try await client.write(request)
+                let received = try await server.read()
+                XCTAssertEqual(received, request)
+                let response = Data("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".utf8)
+                try await server.write(response)
+                await server.close()
+                let returned = try await self.drain(client)
+                XCTAssertEqual(returned, response)
+                await client.close()
+                if index % 50 == 0 {
+                    let event = Data("event: change\ndata: \(index)\n\n".utf8)
+                    try await eventServer.write(event)
+                    let receivedEvent = try await events.read()
+                    XCTAssertEqual(receivedEvent, event)
+                }
+            }
+            let oldestRetained = await a.hasTCPFlow(peer: peer, localPort: firstPort!, remotePort: 80)
+            let newestRetained = await a.hasTCPFlow(peer: peer, localPort: lastPort, remotePort: 80)
+            XCTAssertFalse(oldestRetained, "Closing state evicts oldest flows instead of refusing new requests")
+            XCTAssertTrue(newestRetained, "Recent closing flows remain available for late FINs")
+            let total = await a.connectionCount
+            XCTAssertEqual(total, 1025, "One active SSE connection and at most 1024 closing flows")
+            let final = Data("event: change\ndata: after-bulk\n\n".utf8)
+            try await eventServer.write(final)
+            let receivedFinal = try await events.read()
+            XCTAssertEqual(receivedFinal, final)
+            await events.close(); await eventServer.close()
+        }
+        await a.close(); await b.close()
+    }
+
+    func testClosingFlowsAcknowledgeLateFINAndDisconnectRemovesThem() async throws {
+        let (a, b, link) = await pair()
+        let listener = try await b.listen(port: 80)
+        let client = try await a.connect(peer: addressB, port: 80)
+        let server = try await listener.accept()
+        try await client.closeWrite()
+        let eof = try await server.read()
+        XCTAssertTrue(eof.isEmpty)
+        try await server.closeWrite()
+        await server.close(); await client.close()
+        let before = await link.deliveredACKs
+        await link.replayClientFIN()
+        for _ in 0..<100 {
+            if await link.deliveredACKs > before { break }
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        let after = await link.deliveredACKs
+        let resets = await link.deliveredResets
+        XCTAssertGreaterThan(after, before)
+        XCTAssertEqual(resets, 0, "Retained closing state ACKs a retransmitted FIN without resetting")
+        await a.disconnect(peer: addressB)
+        let count = await a.connectionCount
+        let retained = await a.hasTCPFlow(peer: addressB, localPort: client.localPort, remotePort: 80)
+        XCTAssertEqual(count, 0)
+        XCTAssertFalse(retained)
+        await a.close(); await b.close()
+    }
+
+    func testActiveConnectionBudgetsStillApply() async throws {
+        let (a, b, _) = await pair()
+        var streams: [TailcatConnection] = []
+        for port in 80..<84 {
+            let listener = try await b.listen(port: UInt16(port))
+            for _ in 0..<256 {
+                streams.append(try await a.connect(peer: addressB, port: UInt16(port)))
+                _ = try await listener.accept()
+            }
+            if port == 80 {
+                do {
+                    _ = try await a.connect(peer: addressB, port: 80)
+                    XCTFail("The live per-listener budget must remain bounded")
+                } catch { XCTAssertEqual(error as? TailcatTransportError, .connectionRefused) }
+            }
+        }
+        do {
+            _ = try await a.connect(peer: addressB, port: 84)
+            XCTFail("The live global budget must remain bounded")
+        } catch { XCTAssertEqual(error as? TailcatTransportError, .resourceLimit) }
+        let count = await a.connectionCount
+        XCTAssertEqual(count, 1024)
         await a.close(); await b.close()
     }
 
