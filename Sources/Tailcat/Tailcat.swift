@@ -91,6 +91,11 @@ public actor TailcatServer {
     }
     /// Call after an app observes an interface change to immediately return traffic to DERP.
     public func resetNetworkPaths() async { await engine?.resetNetworkPaths() }
+    /// The server's own TCP flows (its listeners' and those it opened);
+    /// zero before it starts. Forwarded flows are not counted.
+    public var flowStatistics: TailcatFlowStatistics {
+        get async { await engine?.flowStatistics() ?? TailcatFlowStatistics(open: 0, closing: 0) }
+    }
     public func disconnectClient(_ key: NodePublicKey) async {
         await engine?.disconnect(key)
         for listener in udpListeners { await listener.disconnect(peer: key.address) }
@@ -160,6 +165,9 @@ public actor TailcatClient {
     public func close() async { await engine.close() }
     public var path: ConnectionPath { get async { await engine.path(to: serverAddress.serverPublicKey) } }
     public func resetNetworkPaths() async { await engine.resetNetworkPaths() }
+    /// This client's TCP flows to the server, open and closing, against
+    /// the budgets in `TailcatFlowStatistics`.
+    public var flowStatistics: TailcatFlowStatistics { get async { await engine.flowStatistics() } }
 }
 
 /// Owns session state, binds authenticated node identities to tunnel IPs, and drives protocol timers.
@@ -276,6 +284,10 @@ internal actor TailcatEngine {
     }
     func path(to key: NodePublicKey) async -> ConnectionPath { await network.path(to: key.rawValue) }
     func resetNetworkPaths() async { await network.resetDirectPaths() }
+    func flowStatistics() async -> TailcatFlowStatistics {
+        guard let stack else { return TailcatFlowStatistics(open: 0, closing: 0) }
+        return await stack.flowStatistics
+    }
     func disconnect(_ peer: NodePublicKey) async {
         admitting.removeValue(forKey: peer.rawValue)?.1.cancel()
         peers.removeValue(forKey: peer.rawValue)

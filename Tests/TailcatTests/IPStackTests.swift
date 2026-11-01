@@ -264,6 +264,37 @@ final class IPStackTests: XCTestCase {
         await a.close(); await b.close()
     }
 
+    func testFlowStatisticsCountOpenAndClosingFlows() async throws {
+        let (a, b, _) = await pair()
+        let listener = try await b.listen(port: 80)
+        let empty = await a.flowStatistics
+        XCTAssertEqual(empty, TailcatFlowStatistics(open: 0, closing: 0))
+        var clients: [TailcatConnection] = []
+        var servers: [TailcatConnection] = []
+        for _ in 0..<3 {
+            clients.append(try await a.connect(peer: addressB, port: 80))
+            servers.append(try await listener.accept())
+        }
+        let open = await a.flowStatistics
+        let accepted = await b.flowStatistics
+        XCTAssertEqual(open, TailcatFlowStatistics(open: 3, closing: 0))
+        XCTAssertEqual(accepted, TailcatFlowStatistics(open: 3, closing: 0))
+        // Closed by the application: no longer open, still owed a FIN/ACK.
+        await clients[0].close(); await clients[1].close()
+        let closing = await a.flowStatistics
+        XCTAssertEqual(closing, TailcatFlowStatistics(open: 1, closing: 2))
+        let total = await a.connectionCount
+        XCTAssertEqual(total, closing.open + closing.closing)
+        await a.disconnect(peer: addressB)
+        let gone = await a.flowStatistics
+        XCTAssertEqual(gone, TailcatFlowStatistics(open: 0, closing: 0))
+        XCTAssertEqual(TailcatFlowStatistics.openLimit, 1024)
+        XCTAssertEqual(TailcatFlowStatistics.listenerLimit, 256)
+        XCTAssertEqual(TailcatFlowStatistics.closingLimit, 1024)
+        for server in servers { await server.close() }
+        await a.close(); await b.close()
+    }
+
     func testActiveConnectionBudgetsStillApply() async throws {
         let (a, b, _) = await pair()
         var streams: [TailcatConnection] = []

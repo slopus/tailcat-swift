@@ -138,7 +138,7 @@ internal actor IPStack {
     internal func connect(peer: Data, port: UInt16) async throws -> TailcatConnection {
         try validate(peer: peer, port: port)
         try Task.checkCancellation()
-        guard connections.count < 1024 else { throw TailcatTransportError.resourceLimit }
+        guard connections.count < TailcatFlowStatistics.openLimit else { throw TailcatTransportError.resourceLimit }
         let local = try allocatePort(udp: false)
         let state = TCPState(key: FlowKey(peer: peer, localPort: local, remotePort: port),
                              phase: .synSent, sequence: UInt32.random(in: .min ... .max))
@@ -176,6 +176,10 @@ internal actor IPStack {
     /// Includes closing and TIME-WAIT flows, so callers cannot expire a stack
     /// while it still owes a peer retransmission or a final acknowledgement.
     internal var connectionCount: Int { connections.count + closing.count }
+
+    internal var flowStatistics: TailcatFlowStatistics {
+        TailcatFlowStatistics(open: connections.count, closing: closing.count)
+    }
 
     internal func udp(port: UInt16 = 0, idleTimeout: TimeInterval? = 120) throws -> TailcatUDPSocket {
         guard !closed else { throw TailcatTransportError.closed }
@@ -312,8 +316,8 @@ internal actor IPStack {
         guard let id = flows[key], let state = connections[id] ?? closing[id] else {
             if flags & 0x17 == 0x02, let listenerID = listenPorts[key.localPort],
                let listener = listeners[listenerID], listener.pending.count < 128,
-               connections.count < 1024,
-               connections.values.filter({ $0.listener == listenerID }).count < 256 {
+               connections.count < TailcatFlowStatistics.openLimit,
+               connections.values.filter({ $0.listener == listenerID }).count < TailcatFlowStatistics.listenerLimit {
                 let state = TCPState(key: key, phase: .synReceived,
                                      sequence: UInt32.random(in: .min ... .max), listener: listenerID)
                 state.receiveNext = sequence &+ 1
@@ -652,7 +656,7 @@ internal actor IPStack {
         connections[id] = nil
         closing[id] = state
         closingOrder.append(id)
-        if closingOrder.count > 1024, let oldest = closingOrder.first {
+        if closingOrder.count > TailcatFlowStatistics.closingLimit, let oldest = closingOrder.first {
             fail(oldest, error: TailcatTransportError.closed, reset: true)
         }
         state.writeClosed = true

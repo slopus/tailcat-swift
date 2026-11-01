@@ -17,6 +17,27 @@ public enum TailcatTransportError: Error, Equatable, Sendable {
     case resourceLimit
 }
 
+/// A snapshot of one node's TCP flows and the budgets they count against.
+/// Open flows are the live ones (connecting, established, or closed by the
+/// peer but not yet by the application); closing flows are the ones the
+/// application closed that still finish FIN/ACK or sit in TIME-WAIT.
+public struct TailcatFlowStatistics: Equatable, Sendable {
+    /// Live flows a node may hold at once; another connect throws `resourceLimit`.
+    public static let openLimit = 1024
+    /// Live flows one listener may hold at once; another SYN is refused.
+    public static let listenerLimit = 256
+    /// Closing flows kept; past it, the oldest is reset to make room.
+    public static let closingLimit = 1024
+
+    public var open: Int
+    public var closing: Int
+
+    public init(open: Int, closing: Int) {
+        self.open = open
+        self.closing = closing
+    }
+}
+
 /// A TCP byte stream carried directly over the Tailcat IPv6 tunnel.
 public final class TailcatConnection: Sendable {
     public let localAddress: Data
