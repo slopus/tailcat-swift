@@ -36,12 +36,14 @@ enum DERPFrame {
 /// Owns a single TCP connection. Each send is one complete HTTP request or DERP frame.
 private final class DERPStream: @unchecked Sendable {
     let connection: NWConnection
+    private let verifiesTLS: Bool
     private let queue = DispatchQueue(label: "tailcat.derp")
     private let lock = NSLock()
     private var readyContinuation: CheckedContinuation<Void, Error>?
     private var timeoutWork: DispatchWorkItem?
 
     init(node: DERPNode) throws {
+        verifiesTLS = !node.insecureForTests
         let port = node.derpPort > 0 ? node.derpPort : 443
         guard let nwPort = NWEndpoint.Port(rawValue: UInt16(exactly: port) ?? 0), nwPort.rawValue != 0,
               !node.hostName.contains("\r"), !node.hostName.contains("\n") else { throw TransportError.invalidEndpoint }
@@ -105,6 +107,26 @@ private final class DERPStream: @unchecked Sendable {
         }
     }
     func close() { connection.cancel() }
+
+    /// Read the actual peer certificates from this verified TLS 1.3 handshake,
+    /// not a reconstructed trust chain or a key remembered from another client.
+    func fastStartServerKey() -> Data? {
+        guard verifiesTLS,
+              let metadata = connection.metadata(definition: NWProtocolTLS.definition) as? NWProtocolTLS.Metadata,
+              sec_protocol_metadata_get_negotiated_tls_protocol_version(metadata.securityProtocolMetadata) == .TLSv13 else { return nil }
+        var key: Data?, ambiguous = false
+        let available = sec_protocol_metadata_access_peer_certificate_chain(metadata.securityProtocolMetadata) { value in
+            let certificate = sec_certificate_copy_ref(value).takeRetainedValue()
+            var name: CFString?
+            guard SecCertificateCopyCommonName(certificate, &name) == errSecSuccess,
+                  let commonName = name as String?,
+                  let serial = SecCertificateCopySerialNumberData(certificate, nil) as Data?,
+                  let candidate = DERPHandshake.metadataServerKey(commonName: commonName, serialNumber: serial) else { return }
+            if key != nil { ambiguous = true }
+            key = candidate
+        }
+        return available && !ambiguous ? key : nil
+    }
 }
 #else
 /// Loopback-only plaintext backend for protocol integration tests on Linux.
@@ -198,6 +220,7 @@ private final class DERPStream: @unchecked Sendable {
         }
     }
     func close() { _ = shutdown(descriptor, Int32(SHUT_RDWR)) }
+    func fastStartServerKey() -> Data? { nil }
 }
 #endif
 
@@ -230,6 +253,25 @@ public actor DERPTransport {
     }
 
     public init(nodes: [DERPNode], privateKey: Data) {
+        self.init(nodes: nodes, privateKey: privateKey, startupTrace: nil)
+    }
+
+    private let startupTrace: StartupTrace?
+    private var fastStartAllowed = true
+    #if DEBUG
+    private var testFastStartKey: Data?
+    /// Only protocol fixtures may substitute TLS metadata, and only on explicit
+    /// insecure loopback nodes. This hook is absent from release builds.
+    func useFastStartKeyForTesting(_ key: Data) throws {
+        guard key.count == 32, connecting == nil, stream == nil, !closed,
+              nodes.allSatisfy({ $0.insecureForTests && ["127.0.0.1", "::1", "localhost"].contains($0.ipv4.isEmpty ? $0.hostName : $0.ipv4) }) else {
+            throw TransportError.invalidEndpoint
+        }
+        testFastStartKey = key
+    }
+    #endif
+    init(nodes: [DERPNode], privateKey: Data, startupTrace: StartupTrace?) {
+        self.startupTrace = startupTrace
         self.nodes = nodes.filter { !$0.stunOnly }; self.privateKey = privateKey
         var output: AsyncThrowingStream<DERPPacket, Error>.Continuation!
         packets = AsyncThrowingStream(bufferingPolicy: .bufferingNewest(256)) { output = $0 }
@@ -279,7 +321,12 @@ public actor DERPTransport {
                 let id = generation
                 try await rateLimit(packet.count + 37)
                 guard generation == id, !closed else { throw TransportError.closed }
-                do { try await stream.send(DERPFrame.encode(type: 4, payload: key + packet)) }
+                do {
+                    TransportDiagnostics.log("DERP write begin generation=\(id) bytes=\(packet.count)")
+                    try await stream.send(DERPFrame.encode(type: 4, payload: key + packet))
+                    TransportDiagnostics.log("DERP write complete generation=\(id) current=\(generation)")
+                    guard generation == id, !closed else { throw TransportError.closed }
+                }
                 catch { failed(id: id); throw error }
                 return
             } catch {
@@ -298,6 +345,14 @@ public actor DERPTransport {
         for waiter in rateWaiters.values { waiter.cancel() }
         stream?.close(); stream = nil
         continuation.finish()
+    }
+
+    /// Restart the relay connection without terminating its packet stream.
+    public func notifyNetworkChanged() {
+        guard !closed else { return }
+        TransportDiagnostics.log("DERP reset generation=\(generation)")
+        connecting?.task.cancel()
+        failed(id: generation, reconnectDelay: 0)
     }
 
     private func rateLimit(_ size: Int) async throws {
@@ -332,10 +387,27 @@ public actor DERPTransport {
         throw lastError
     }
 
+    private struct FastStartFailure: Error { let underlying: Error }
+
     private func establish(node: DERPNode) async throws {
+        do { try await establish(node: node, allowFastStart: fastStartAllowed) }
+        catch is FastStartFailure {
+            try Task.checkCancellation()
+            guard !closed else { throw TransportError.closed }
+            fastStartAllowed = false
+            // A stale/misconfigured capability or an old HTTP intermediary must
+            // not prevent a normal authenticated connection. Retry once, using
+            // another socket and a fresh ClientInfo nonce.
+            startupTrace?.record("derpFastStartFallback")
+            try await establish(node: node, allowFastStart: false)
+        }
+    }
+
+    private func establish(node: DERPNode, allowFastStart: Bool) async throws {
         guard privateKey.count == 32 else { throw TransportError.invalidKey }
         let connection = try DERPStream(node: node)
         let id = UUID(); generation = id
+        startupTrace?.record("relayConnectionCreated", detail: id.uuidString)
         stream = connection; incoming = Data()
         // A separate timer closes stalled TLS, HTTP and DERP authentication reads.
         let timeout = Task {
@@ -343,49 +415,66 @@ public actor DERPTransport {
             if !Task.isCancelled { connection.close() }
         }
         defer { timeout.cancel() }
+        var attemptedFastStart = false
         do {
+            startupTrace?.record("tcpTLSStart")
             try await connection.start()
+            startupTrace?.record("tcpTLSReady")
             try Task.checkCancellation()
             let host = node.hostName
-            try await connection.send(Data("GET /derp HTTP/1.1\r\nHost: \(host)\r\nUpgrade: DERP\r\nConnection: Upgrade\r\n\r\n".utf8))
-            var headerEnd: Range<Data.Index>?
-            while headerEnd == nil {
-                guard incoming.count < 16384 else { throw TransportError.oversizedPacket }
-                incoming.append(try await connection.receive())
-                headerEnd = incoming.range(of: Data([13,10,13,10]))
+            var fastStartKey = allowFastStart ? connection.fastStartServerKey() : nil
+            #if DEBUG
+            if allowFastStart, node.insecureForTests, let testFastStartKey { fastStartKey = testFastStartKey }
+            #endif
+            attemptedFastStart = fastStartKey != nil
+            var request = Data("GET /derp HTTP/1.1\r\nHost: \(host)\r\nUpgrade: DERP\r\nConnection: Upgrade\r\n\(attemptedFastStart ? "Derp-Fast-Start: 1\r\n" : "")\r\n".utf8)
+            if let fastStartKey {
+                startupTrace?.record("derpFastStartSelected")
+                request.append(try DERPHandshake.clientInfo(privateKey: privateKey, serverKey: fastStartKey))
             }
-            guard let end = headerEnd,
-                  end.upperBound <= 16384,
-                  let text = String(data: incoming[..<end.lowerBound], encoding: .utf8) else { throw TransportError.malformedPacket }
-            let lines = text.components(separatedBy: "\r\n")
-            guard let status = lines.first, status.hasPrefix("HTTP/1.1 101 ") || status == "HTTP/1.1 101" else {
-                throw TransportError.connectionFailed("DERP HTTP upgrade rejected")
+            try await connection.send(request)
+            startupTrace?.record("httpUpgradeWritten")
+            if attemptedFastStart { startupTrace?.record("clientInfoWritten") }
+            if !attemptedFastStart {
+                var headerEnd: Range<Data.Index>?
+                while headerEnd == nil {
+                    guard incoming.count < 16384 else { throw TransportError.oversizedPacket }
+                    incoming.append(try await connection.receive())
+                    headerEnd = incoming.range(of: Data([13,10,13,10]))
+                }
+                guard let end = headerEnd,
+                      end.upperBound <= 16384,
+                      let text = String(data: incoming[..<end.lowerBound], encoding: .utf8) else { throw TransportError.malformedPacket }
+                let lines = text.components(separatedBy: "\r\n")
+                guard let status = lines.first, status.hasPrefix("HTTP/1.1 101 ") || status == "HTTP/1.1 101" else {
+                    throw TransportError.connectionFailed("DERP HTTP upgrade rejected")
+                }
+                var headers = [String: String]()
+                for line in lines.dropFirst() {
+                    guard let colon = line.firstIndex(of: ":") else { throw TransportError.malformedPacket }
+                    headers[String(line[..<colon]).lowercased()] = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces).lowercased()
+                }
+                guard headers["upgrade"] == "derp",
+                      headers["connection"]?.split(separator: ",").contains(where: { $0.trimmingCharacters(in: .whitespaces) == "upgrade" }) == true else {
+                    throw TransportError.malformedPacket
+                }
+                incoming = Data(incoming[end.upperBound...])
             }
-            var headers = [String: String]()
-            for line in lines.dropFirst() {
-                guard let colon = line.firstIndex(of: ":") else { throw TransportError.malformedPacket }
-                headers[String(line[..<colon]).lowercased()] = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces).lowercased()
-            }
-            guard headers["upgrade"] == "derp",
-                  headers["connection"]?.split(separator: ",").contains(where: { $0.trimmingCharacters(in: .whitespaces) == "upgrade" }) == true else {
-                throw TransportError.malformedPacket
-            }
-            incoming = Data(incoming[end.upperBound...])
             let greeting = try await readFrame(connection)
-            guard greeting.type == 1, greeting.payload.count >= 40, greeting.payload.count <= 1024,
-                  greeting.payload.prefix(8) == Data("DERP🔑".utf8) else { throw TransportError.malformedPacket }
-            let serverKey = Data(greeting.payload.dropFirst(8).prefix(32))
-            let nonce = NaClBox.random(24)
-            let info = Data("{\"version\":2,\"CanAckPings\":true}".utf8)
-            let auth = try NaClBox.publicKey(for: privateKey) + nonce +
-                NaClBox.seal(info, nonce: nonce, publicKey: serverKey, privateKey: privateKey)
-            try await connection.send(DERPFrame.encode(type: 2, payload: auth))
+            guard greeting.type == 1 else { throw TransportError.malformedPacket }
+            let serverKey = try DERPHandshake.serverKey(greeting: greeting.payload, expected: fastStartKey)
+            startupTrace?.record("httpUpgradeAndGreetingReceived")
+            if !attemptedFastStart {
+                try await connection.send(DERPHandshake.clientInfo(privateKey: privateKey, serverKey: serverKey))
+                startupTrace?.record("clientInfoWritten")
+            }
             let serverInfo = try await readFrame(connection)
             guard serverInfo.type == 3, serverInfo.payload.count >= 40 else { throw TransportError.malformedPacket }
             let json = try NaClBox.open(Data(serverInfo.payload.dropFirst(24)), nonce: Data(serverInfo.payload.prefix(24)),
                                        publicKey: serverKey, privateKey: privateKey)
             guard let info = try JSONSerialization.jsonObject(with: json) as? [String: Any],
                   let version = info["version"] as? Int, version >= 2 else { throw TransportError.malformedPacket }
+            startupTrace?.record("serverInfoVerified")
             tokenRate = Double(max(0, (info["TokenBucketBytesPerSecond"] as? Int) ?? 0))
             tokenBurst = Double(max(0, (info["TokenBucketBytesBurst"] as? Int) ?? 0))
             tokens = tokenBurst; tokenDate = ProcessInfo.processInfo.systemUptime; lastReceived = Date()
@@ -396,7 +485,9 @@ public actor DERPTransport {
             watchdog = Task { await keepaliveLoop(connection, id: id) }
         } catch {
             connection.close()
+            let canRetry = attemptedFastStart && generation == id && !closed && !Task.isCancelled
             if generation == id { stream = nil; incoming = Data() }
+            if canRetry { throw FastStartFailure(underlying: error) }
             throw error
         }
     }

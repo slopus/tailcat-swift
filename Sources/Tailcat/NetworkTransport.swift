@@ -4,6 +4,17 @@ import Foundation
 #if canImport(Network)
 import Network
 #endif
+
+// Opt-in diagnostics for physical-device route-transition investigations. No
+// plaintext, private keys, or discovery ciphertext is logged.
+enum TransportDiagnostics {
+    static let enabled = ProcessInfo.processInfo.environment["TAILCAT_TRACE"] == "1"
+    static func log(_ message: @autoclosure () -> String) {
+        guard enabled else { return }
+        let text = "TRACE \(ProcessInfo.processInfo.systemUptime) \(message())\n"
+        FileHandle.standardError.write(Data(text.utf8))
+    }
+}
 #if canImport(Darwin)
 import Darwin
 #else
@@ -85,8 +96,14 @@ final class UDPChannel: @unchecked Sendable {
         }
         guard named == 0 else { Self.closeDescriptor(fd); throw TransportError.connectionFailed("UDP port: \(errno)") }
         port = UInt16(bigEndian: address.sin6_port)
+        TransportDiagnostics.log("UDP open port=\(port) flags=\(fcntl(fd, F_GETFL)) nonblock=\(O_NONBLOCK)")
         source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
         source.setEventHandler {
+            let batchStart = ProcessInfo.processInfo.systemUptime
+            defer {
+                let elapsed = ProcessInfo.processInfo.systemUptime - batchStart
+                if elapsed > 0.01 { TransportDiagnostics.log("UDP receive batch fd=\(fd) durationMs=\(elapsed * 1000)") }
+            }
             var buffer = [UInt8](repeating: 0, count: 65536)
             for _ in 0..<64 {
                 var remote = sockaddr_storage()
@@ -98,6 +115,7 @@ final class UDPChannel: @unchecked Sendable {
                 }
                 guard count >= 0 else { break }
                 guard let endpoint = Self.endpoint(remote, size: size) else { continue }
+                TransportDiagnostics.log("UDP raw receive fd=\(fd) from=\(endpoint) bytes=\(count)")
                 receive(Data(buffer.prefix(count)), endpoint)
             }
         }
@@ -187,8 +205,13 @@ final class UDPChannel: @unchecked Sendable {
     func send(_ packet: Data, to endpoint: DiscoveryEndpoint) async throws {
         let wire = try endpoint.wireBytes()
         guard packet.count <= 65507 else { throw TransportError.oversizedPacket }
+        let queued = ProcessInfo.processInfo.systemUptime
+        let isDiscovery = Discovery.isPacket(packet)
+        if isDiscovery { TransportDiagnostics.log("UDP enqueue port=\(port) to=\(endpoint) bytes=\(packet.count)") }
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             queue.async { [self] in
+                let executing = ProcessInfo.processInfo.systemUptime
+                if isDiscovery || executing - queued > 0.01 { TransportDiagnostics.log("UDP execute port=\(port) to=\(endpoint) queuedMs=\((executing - queued) * 1000)") }
                 guard !closed else { continuation.resume(throwing: TransportError.closed); return }
                 var address = sockaddr_in6()
                 address.sin6_family = sa_family_t(AF_INET6)
@@ -204,6 +227,8 @@ final class UDPChannel: @unchecked Sendable {
                         }
                     }
                 }
+                let finished = ProcessInfo.processInfo.systemUptime
+                if isDiscovery || finished - executing > 0.01 { TransportDiagnostics.log("UDP complete port=\(port) to=\(endpoint) syscallMs=\((finished - executing) * 1000) count=\(count)") }
                 if count == packet.count { continuation.resume() }
                 else { continuation.resume(throwing: TransportError.connectionFailed("UDP send: \(errno)")) }
             }
@@ -236,14 +261,47 @@ final class UDPChannel: @unchecked Sendable {
     }
 }
 
+/// Blocking OS discovery runs outside the transport actor. Internal injection keeps
+/// startup and stale-completion tests deterministic without changing the public API.
+struct DirectDiscovery: Sendable {
+    var open: @Sendable (@escaping @Sendable (Data, DiscoveryEndpoint) -> Void) async throws -> UDPChannel = { receive in
+        try await Task.detached { try UDPChannel(receive: receive) }.value
+    }
+    var interfaces: @Sendable (UDPChannel) async -> [DiscoveryEndpoint] = { channel in
+        await Task.detached { channel.interfaceEndpoints() }.value
+    }
+    var resolve: @Sendable (String, UInt16) async throws -> [DiscoveryEndpoint] = { host, port in
+        try await UDPChannel.resolve(host: host, port: port)
+    }
+}
+
 /// Routes encrypted WireGuard datagrams over verified UDP paths, with DERP fallback.
 public actor NetworkTransport {
     public nonisolated let packets: AsyncThrowingStream<TransportPacket, Error>
     private let continuation: AsyncThrowingStream<TransportPacket, Error>.Continuation
     private let privateKey: Data
+    private var nodePublicKey: Data?
     private let discoPrivateKey: Data
     private let relay: DERPTransport
     private let relayNodes: [DERPNode]
+    private let relayFirst: Bool
+    private let discovery: DirectDiscovery
+    private let deferDirectUntilAuthenticated: Bool
+    private var networkGeneration = UUID()
+    private var discoveryTask: Task<Void, Never>?
+    private var discoveryID = UUID()
+    private var resetTask: Task<Void, Never>?
+    private var pendingNetworkChange = false
+    private var probeTasks = [Data: Task<Void, Never>]()
+    private var pendingProbes = Set<Data>()
+    private var invitationTasks = [Data: Task<Void, Never>]()
+    private var relayMarkerProvider: (@Sendable (Data) async throws -> Data?)?
+    private struct RelayMarker {
+        let id = UUID()
+        var task: Task<Void, Error>?
+    }
+    private var relayMarkers = [Data: RelayMarker]()
+    private var interfaceEndpoints = [DiscoveryEndpoint]()
     private var udp: UDPChannel?
     private var udpIngress: UDPIngress?
     private var udpReader: Task<Void, Never>?
@@ -255,6 +313,10 @@ public actor NetworkTransport {
     private struct Peer {
         var discoKey: Data
         var endpoints: Set<DiscoveryEndpoint>
+        var invitedEndpoints = Set<DiscoveryEndpoint>()
+        var authenticatedCounters = [Data: UInt64]()
+        var receiverOrder = [Data]()
+        var directAllowed = true
         var direct: DiscoveryEndpoint?
         var verified = Date.distantPast
         var lastProbe = Date.distantPast
@@ -268,6 +330,7 @@ public actor NetworkTransport {
         let peer: Data
         let endpoint: DiscoveryEndpoint
         let sent: Date
+        let generation: UUID
     }
     private var peers = [Data: Peer]()
     private var probes = [Data: Probe]()
@@ -281,13 +344,21 @@ public actor NetworkTransport {
     private var pathSignature: String?
     #endif
 
-    public init(privateKey: Data, discoPrivateKey: Data, relayNode: DERPNode) {
-        self.init(privateKey: privateKey, discoPrivateKey: discoPrivateKey, relayNodes: [relayNode])
+    public init(privateKey: Data, discoPrivateKey: Data, relayNode: DERPNode, relayFirst: Bool = false) {
+        self.init(privateKey: privateKey, discoPrivateKey: discoPrivateKey, relayNodes: [relayNode], relayFirst: relayFirst)
     }
 
-    public init(privateKey: Data, discoPrivateKey: Data, relayNodes: [DERPNode]) {
+    public init(privateKey: Data, discoPrivateKey: Data, relayNodes: [DERPNode], relayFirst: Bool = false) {
+        self.init(privateKey: privateKey, discoPrivateKey: discoPrivateKey, relayNodes: relayNodes, relayFirst: relayFirst, discovery: DirectDiscovery())
+    }
+
+    private let startupTrace: StartupTrace?
+    init(privateKey: Data, discoPrivateKey: Data, relayNodes: [DERPNode], relayFirst: Bool, discovery: DirectDiscovery, deferDirectUntilAuthenticated: Bool = false, startupTrace: StartupTrace? = nil) {
         self.privateKey = privateKey; self.discoPrivateKey = discoPrivateKey; self.relayNodes = relayNodes
-        relay = DERPTransport(nodes: relayNodes, privateKey: privateKey)
+        self.relayFirst = relayFirst; self.discovery = discovery
+        self.deferDirectUntilAuthenticated = deferDirectUntilAuthenticated
+        self.startupTrace = startupTrace
+        relay = DERPTransport(nodes: relayNodes, privateKey: privateKey, startupTrace: startupTrace)
         var output: AsyncThrowingStream<TransportPacket, Error>.Continuation!
         packets = AsyncThrowingStream(bufferingPolicy: .bufferingNewest(256)) { output = $0 }
         continuation = output
@@ -312,22 +383,14 @@ public actor NetworkTransport {
     private func begin() async throws {
         try Task.checkCancellation()
         _ = try NaClBox.publicKey(for: discoPrivateKey)
+        nodePublicKey = try NaClBox.publicKey(for: privateKey)
         do {
-            let ingress = UDPIngress()
-            udpIngress = ingress
-            udp = try UDPChannel { packet, endpoint in
-                ingress.offer(packet, from: endpoint)
-            }
-            udpReader = Task { [weak self] in
-                for await datagram in ingress.packets {
-                    guard !Task.isCancelled else { break }
-                    await self?.receiveUDP(datagram.payload, from: datagram.source)
-                }
-            }
+            if !relayFirst { try await prepareUDP(generation: networkGeneration) }
             try await relay.connect()
             try Task.checkCancellation()
             guard !closed else { throw TransportError.closed }
             started = true
+            TransportDiagnostics.log("ready relayFirst=\(relayFirst) udp=\(udp?.port ?? 0)")
             relayReader = Task { [weak self, relay] in
                 do {
                     for try await packet in relay.packets { await self?.receiveRelay(packet) }
@@ -337,16 +400,81 @@ public actor NetworkTransport {
             monitorNetworkPath()
             #endif
             maintenance = Task { [weak self] in
-                await self?.discoverSTUNServers()
                 while !Task.isCancelled {
                     await self?.maintain()
                     do { try await Task.sleep(nanoseconds: 5_000_000_000) } catch { break }
                 }
             }
+            scheduleDiscovery()
+            if pendingNetworkChange {
+                pendingNetworkChange = false
+                notifyNetworkChanged()
+            }
         } catch {
             udpIngress?.finish(); udpIngress = nil; udpReader?.cancel(); udpReader = nil
             udp?.close(); udp = nil; throw error
         }
+    }
+
+    private func prepareUDP(generation: UUID) async throws {
+        guard !closed, !Task.isCancelled, networkGeneration == generation else { throw TransportError.closed }
+        guard udp == nil else { return }
+        let ingress = UDPIngress()
+        let channel = try await discovery.open { packet, endpoint in
+            let result = ingress.offer(packet, from: endpoint)
+            if result != .queued { TransportDiagnostics.log("UDP ingress \(result) from=\(endpoint) bytes=\(packet.count)") }
+        }
+        guard !closed, !Task.isCancelled, networkGeneration == generation else {
+            ingress.finish(); channel.close(); throw TransportError.closed
+        }
+        udp = channel; udpIngress = ingress
+        startupTrace?.record("udpBound", detail: String(channel.port))
+        udpReader = Task { [weak self] in
+            for await datagram in ingress.packets {
+                guard !Task.isCancelled else { break }
+                await self?.receiveUDP(datagram.payload, from: datagram.source, generation: generation)
+            }
+        }
+        let endpoints = await discovery.interfaces(channel)
+        guard !closed, !Task.isCancelled, networkGeneration == generation else { throw TransportError.closed }
+        interfaceEndpoints = endpoints
+        startupTrace?.record("interfacesEnumerated")
+    }
+
+    private func scheduleDiscovery() {
+        guard started, !closed, discoveryTask == nil else { return }
+        let generation = networkGeneration, id = UUID()
+        discoveryID = id
+        discoveryTask = Task { [weak self] in
+            await self?.discover(generation: generation, id: id)
+        }
+    }
+
+    private func discover(generation: UUID, id: UUID) async {
+        defer {
+            if discoveryID == id {
+                discoveryTask = nil
+                // A blocking OS lookup cannot always be cancelled. Keep just one
+                // worker and start the new generation when the old one releases it.
+                if generation != networkGeneration, resetTask == nil { scheduleDiscovery() }
+            }
+        }
+        let previousEndpoints = interfaceEndpoints
+        do { try await prepareUDP(generation: generation) } catch { return }
+        guard !closed, !Task.isCancelled, networkGeneration == generation else { return }
+        if let udp {
+            let endpoints = await discovery.interfaces(udp)
+            guard !closed, !Task.isCancelled, networkGeneration == generation else { return }
+            interfaceEndpoints = endpoints
+        }
+        for key in peers.keys {
+            if interfaceEndpoints != previousEndpoints { peers[key]?.lastCall = .distantPast }
+            scheduleProbe(key); scheduleInvitation(key)
+        }
+        await discoverSTUNServers()
+        guard !closed, !Task.isCancelled, networkGeneration == generation else { return }
+        lastSTUN = .distantPast
+        await maintain()
     }
 
     private func discoverSTUNServers() async {
@@ -356,11 +484,11 @@ public actor NetworkTransport {
             guard !closed, !Task.isCancelled, stunDiscoveryGeneration == generation else { return }
             let port = UInt16(exactly: node.stunPort > 0 ? node.stunPort : 3478) ?? 3478
             let host = !node.ipv4.isEmpty && node.ipv4 != "none" ? node.ipv4 : node.hostName
-            let ipv4 = (try? await UDPChannel.resolve(host: host, port: port)) ?? []
+            let ipv4 = (try? await discovery.resolve(host, port)) ?? []
             guard !closed, !Task.isCancelled, stunDiscoveryGeneration == generation else { return }
             discovered.formUnion(ipv4)
             if !node.ipv6.isEmpty, node.ipv6 != "none" {
-                let ipv6 = (try? await UDPChannel.resolve(host: node.ipv6, port: port)) ?? []
+                let ipv6 = (try? await discovery.resolve(node.ipv6, port)) ?? []
                 guard !closed, !Task.isCancelled, stunDiscoveryGeneration == generation else { return }
                 discovered.formUnion(ipv6)
             }
@@ -387,14 +515,13 @@ public actor NetworkTransport {
         let previous = pathSignature
         pathSignature = signature
         guard let previous, previous != signature else { return }
-        resetDirectPaths()
-        await discoverSTUNServers()
-        guard !closed, pathSignature == signature else { return }
-        await maintain()
+        TransportDiagnostics.log("OS path changed old=\(previous) new=\(signature)")
+        notifyNetworkChanged()
     }
     #endif
 
     public func configurePeer(nodeKey: Data, discoKey: Data, endpoints: [String] = []) async throws {
+        guard !closed else { throw TransportError.closed }
         guard nodeKey.count == 32, discoKey.count == 32,
               nodeKey.contains(where: { $0 != 0 }), discoKey.contains(where: { $0 != 0 }) else { throw TransportError.invalidKey }
         // A discovery key belongs to exactly one configured WireGuard identity.
@@ -405,11 +532,18 @@ public actor NetworkTransport {
             peer.endpoints.formUnion(addresses)
             guard peer.endpoints.count <= 128 else { throw TransportError.oversizedPacket }
             peers[nodeKey] = peer
-        } else { peers[nodeKey] = Peer(discoKey: discoKey, endpoints: addresses) }
-        if started { await probe(nodeKey); await callMeMaybe(nodeKey) }
+        } else {
+            removePeer(nodeKey)
+            peers[nodeKey] = Peer(discoKey: discoKey, endpoints: addresses, directAllowed: !deferDirectUntilAuthenticated)
+        }
+        if started { scheduleProbe(nodeKey); scheduleInvitation(nodeKey) }
     }
 
     public func removePeer(_ nodeKey: Data) {
+        relayMarkers.removeValue(forKey: nodeKey)?.task?.cancel()
+        pendingProbes.remove(nodeKey)
+        probeTasks.removeValue(forKey: nodeKey)?.cancel()
+        invitationTasks.removeValue(forKey: nodeKey)?.cancel()
         peers[nodeKey] = nil
         probes = probes.filter { $0.value.peer != nodeKey }
     }
@@ -417,49 +551,205 @@ public actor NetworkTransport {
     public func removePeer(nodeKey: Data) { removePeer(nodeKey) }
 
     public func path(to nodeKey: Data) -> ConnectionPath {
-        guard let peer = peers[nodeKey], let endpoint = peer.direct, udp != nil,
+        guard !closed, let peer = peers[nodeKey], peer.directAllowed, let endpoint = peer.direct, udp != nil,
               Date().timeIntervalSince(peer.verified) < 30 else { return .relay }
         return .direct(endpoint: endpoint.description)
+    }
+
+    /// The engine calls this only after completing the initial encrypted handshake.
+    func allowDirect(to nodeKey: Data) {
+        guard !closed, peers[nodeKey]?.directAllowed == false else { return }
+        peers[nodeKey]?.directAllowed = true
+        startupTrace?.record("directAuthenticationGateOpened")
+        scheduleProbe(nodeKey); scheduleInvitation(nodeKey)
+    }
+
+    func setRelayMarkerProvider(_ provider: @escaping @Sendable (Data) async throws -> Data?) {
+        relayMarkerProvider = provider
+    }
+
+    /// Called only after WireGuard authentication. Only a fresh relayed empty
+    /// transport packet from an established peer withdraws its old route.
+    func observeAuthenticatedTransport(from nodeKey: Data, viaRelay: Bool, receiver: Data,
+                                       counter: UInt64, allowFallback: Bool) {
+        guard !closed, viaRelay, allowFallback, var peer = peers[nodeKey] else { return }
+        if let previous = peer.authenticatedCounters[receiver], counter <= previous { return }
+        if peer.authenticatedCounters[receiver] == nil {
+            peer.receiverOrder.append(receiver)
+            if peer.receiverOrder.count > 3 {
+                let retired = peer.receiverOrder.removeFirst()
+                peer.authenticatedCounters[retired] = nil
+            }
+        }
+        peer.authenticatedCounters[receiver] = counter
+        let newestReceiver = peer.receiverOrder.last == receiver
+        peers[nodeKey] = peer
+        guard newestReceiver else { return }
+        // A pre-reset challenge must also be retired when no direct route has
+        // won yet; its delayed Pong cannot restore the peer's abandoned socket.
+        invalidateDirectPath(to: nodeKey)
+        TransportDiagnostics.log("authenticated relay reset marker; fallback and revalidate")
+        scheduleProbe(nodeKey, force: true); scheduleInvitation(nodeKey)
     }
 
     /// Invalidates a failed path immediately; discovery can establish a fresh path later.
     func invalidateDirectPath(to nodeKey: Data) {
         peers[nodeKey]?.direct = nil
+        invalidateProbes(to: nodeKey)
+    }
+
+    private func invalidateProbes(to nodeKey: Data) {
+        pendingProbes.remove(nodeKey)
         peers[nodeKey]?.generation = UUID()
         probes = probes.filter { $0.value.peer != nodeKey }
+        probeTasks.removeValue(forKey: nodeKey)?.cancel()
+        invitationTasks.removeValue(forKey: nodeKey)?.cancel()
     }
 
     /// Call after a network change to discard paths tied to the previous NAT mapping.
     public func resetDirectPaths() {
+        guard !closed else { return }
+        for task in probeTasks.values { task.cancel() }; probeTasks.removeAll()
+        pendingProbes.removeAll()
+        for task in invitationTasks.values { task.cancel() }; invitationTasks.removeAll()
         for key in peers.keys {
             peers[key]?.direct = nil; peers[key]?.lastProbe = .distantPast; peers[key]?.generation = UUID()
             peers[key]?.lastCall = .distantPast; peers[key]?.lastInvitation = .distantPast
             peers[key]?.inbound.removeAll()
+            peers[key]?.endpoints.removeAll()
+            peers[key]?.invitedEndpoints.removeAll()
         }
         probes.removeAll(); stun.removeAll(); observed.removeAll(); lastSTUN = .distantPast
+    }
+
+    /// Coalesced background discovery; keeps the selected route and encrypted session intact.
+    public func retryDirect(to nodeKey: Data? = nil) {
+        guard started, !closed else { return }
+        scheduleDiscovery()
+        for key in nodeKey.map({ [$0] }) ?? Array(peers.keys) {
+            scheduleProbe(key); scheduleInvitation(key)
+        }
+    }
+
+    /// Invalidate old candidates and socket callbacks before beginning network recovery.
+    public func notifyNetworkChanged() {
+        TransportDiagnostics.log("notifyNetworkChanged started=\(started) pending=\(resetTask != nil) udp=\(udp?.port ?? 0)")
+        guard !closed else { return }
+        guard started, resetTask == nil else {
+            pendingNetworkChange = true
+            return
+        }
+        networkGeneration = UUID(); stunDiscoveryGeneration = UUID()
+        for key in peers.keys { requestRelayMarker(to: key) }
+        discoveryTask?.cancel()
+        resetDirectPaths()
+        udpIngress?.finish(); udpIngress = nil; udpReader?.cancel(); udpReader = nil
+        udp?.close(); udp = nil; interfaceEndpoints.removeAll(); stunServers.removeAll()
+        let generation = networkGeneration
+        resetTask = Task { [weak self, relay] in
+            await relay.notifyNetworkChanged()
+            await self?.finishNetworkReset(generation: generation)
+        }
+    }
+
+    private func finishNetworkReset(generation: UUID) {
+        guard !closed, networkGeneration == generation else { return }
+        resetTask = nil
+        if pendingNetworkChange {
+            pendingNetworkChange = false
+            notifyNetworkChanged()
+        } else {
+            scheduleDiscovery()
+            for key in relayMarkers.keys {
+                Task { [weak self] in try? await self?.sendPendingRelayMarker(to: key) }
+            }
+        }
+    }
+
+    private func requestRelayMarker(to key: Data) {
+        relayMarkers[key]?.task?.cancel()
+        relayMarkers[key] = RelayMarker()
+    }
+
+    private func markerIsCurrent(_ id: UUID, to key: Data) -> Bool {
+        !closed && peers[key] != nil && relayMarkers[key]?.id == id
+    }
+
+    /// Every outgoing frame joins the same per-peer barrier. The provider only
+    /// encrypts a keepalive; it never calls back into network.send.
+    private func sendPendingRelayMarker(to key: Data) async throws {
+        while let marker = relayMarkers[key] {
+            while let resetTask {
+                await resetTask.value
+                try Task.checkCancellation()
+            }
+            guard !closed else { throw TransportError.closed }
+            guard relayMarkers[key]?.id == marker.id else { continue }
+            guard let provider = relayMarkerProvider else { relayMarkers[key] = nil; return }
+            let task: Task<Void, Error>
+            if let existing = relayMarkers[key]?.task { task = existing }
+            else {
+                task = Task { [weak self, relay] in
+                    guard let packet = try await provider(key) else { return }
+                    try Task.checkCancellation()
+                    guard await self?.markerIsCurrent(marker.id, to: key) == true else { throw CancellationError() }
+                    TransportDiagnostics.log("send authenticated relay reset marker")
+                    try await relay.send(to: key, packet: packet)
+                }
+                relayMarkers[key]?.task = task
+            }
+            do { try await task.value }
+            catch {
+                if relayMarkers[key]?.id != marker.id { continue }
+                relayMarkers[key]?.task = nil
+                throw error
+            }
+            if relayMarkers[key]?.id == marker.id { relayMarkers[key] = nil }
+        }
+        guard !closed else { throw TransportError.closed }
     }
 
     public func send(to nodeKey: Data, packet: Data) async throws {
         guard !closed else { throw TransportError.closed }
         guard nodeKey.count == 32 else { throw TransportError.invalidKey }
         if !started { try await start() }
+        // Network invalidation is immediate, but DERP lives on a separate actor.
+        // Do not hand a new packet to its old connection before reset reaches it.
+        while let resetTask {
+            await resetTask.value
+            try Task.checkCancellation()
+            guard !closed else { throw TransportError.closed }
+        }
+        try await sendPendingRelayMarker(to: nodeKey)
         if packet.starts(with: Data("meow".utf8)) {
             try await relay.send(to: nodeKey, packet: packet)
             return
         }
-        if packet.count <= UDPIngress.maximumDatagramSize, let peer = peers[nodeKey], let direct = peer.direct,
+        if packet.count <= UDPIngress.maximumDatagramSize, let peer = peers[nodeKey], peer.directAllowed, let direct = peer.direct,
            Date().timeIntervalSince(peer.verified) < 30, let udp {
+            TransportDiagnostics.log("send direct udp=\(udp.port) to=\(direct) bytes=\(packet.count) type=\(WireGuard.packetType(packet) ?? 0)")
             do { try await udp.send(packet, to: direct); return }
-            catch { invalidateDirectPath(to: nodeKey) }
+            catch {
+                if peers[nodeKey]?.generation == peer.generation {
+                    invalidateDirectPath(to: nodeKey)
+                    requestRelayMarker(to: nodeKey)
+                }
+            }
         }
+        if let peer = peers[nodeKey], peer.direct != nil, Date().timeIntervalSince(peer.verified) >= 30 {
+            invalidateDirectPath(to: nodeKey)
+            requestRelayMarker(to: nodeKey)
+        }
+        try await sendPendingRelayMarker(to: nodeKey)
+        TransportDiagnostics.log("send relay udp=\(udp?.port ?? 0) bytes=\(packet.count) type=\(WireGuard.packetType(packet) ?? 0)")
         try await relay.send(to: nodeKey, packet: packet)
         if let peer = peers[nodeKey], Date().timeIntervalSince(peer.lastProbe) >= 5 {
-            await probe(nodeKey); await callMeMaybe(nodeKey)
+            scheduleProbe(nodeKey); scheduleInvitation(nodeKey)
         }
     }
 
     public func localEndpoints() -> [String] {
-        var endpoints = Set(udp?.interfaceEndpoints() ?? [])
+        var endpoints = Set(interfaceEndpoints)
         for (endpoint, date) in observed where Date().timeIntervalSince(date) < 120 { endpoints.insert(endpoint) }
         return endpoints.map(\.description).sorted()
     }
@@ -468,26 +758,37 @@ public actor NetworkTransport {
         guard !closed else { return }
         closed = true; started = false
         starting?.cancel(); relayReader?.cancel(); maintenance?.cancel()
+        discoveryTask?.cancel(); discoveryTask = nil; resetTask?.cancel(); resetTask = nil
+        networkGeneration = UUID(); stunDiscoveryGeneration = UUID()
+        for task in probeTasks.values { task.cancel() }; probeTasks.removeAll()
+        pendingProbes.removeAll()
+        for marker in relayMarkers.values { marker.task?.cancel() }; relayMarkers.removeAll()
+        for task in invitationTasks.values { task.cancel() }; invitationTasks.removeAll()
         udpIngress?.finish(); udpIngress = nil; udpReader?.cancel(); udpReader = nil
         #if canImport(Network)
         pathMonitor?.cancel(); pathMonitor = nil
         #endif
-        udp?.close(); udp = nil
+        udp?.close(); udp = nil; peers.removeAll(); probes.removeAll(); interfaceEndpoints.removeAll()
         await relay.close(); continuation.finish()
     }
 
     private func relayEnded(_ error: Error) { if !closed { continuation.finish(throwing: error) } }
 
     private func receiveRelay(_ packet: DERPPacket) async {
+        guard !closed else { return }
         if Discovery.isPacket(packet.payload) {
             await receiveDiscovery(packet.payload, endpoint: nil, relaySource: packet.source)
         } else {
+            TransportDiagnostics.log("receive relay udp=\(udp?.port ?? 0) bytes=\(packet.payload.count) type=\(WireGuard.packetType(packet.payload) ?? 0)")
             continuation.yield(TransportPacket(source: packet.source, payload: packet.payload, viaRelay: true))
         }
     }
 
-    private func receiveUDP(_ packet: Data, from endpoint: DiscoveryEndpoint) async {
-        guard !closed else { return }
+    private func receiveUDP(_ packet: Data, from endpoint: DiscoveryEndpoint, generation: UUID) async {
+        guard !closed, networkGeneration == generation else {
+            TransportDiagnostics.log("UDP stale generation from=\(endpoint) bytes=\(packet.count)")
+            return
+        }
         if packet.count >= 20, packet.prefix(2) == Data([1,1]),
            packet.dropFirst(4).prefix(4) == Data([0x21,0x12,0xa4,0x42]) {
             let transaction = Data(packet.dropFirst(8).prefix(12))
@@ -495,17 +796,23 @@ public actor NetworkTransport {
                   Date().timeIntervalSince(pending.sent) < 10,
                   let mapped = try? STUN.response(packet, transaction: transaction) else { return }
             stun[transaction] = nil; observed[mapped] = Date()
-            for key in peers.keys { await callMeMaybe(key) }
+            for key in peers.keys {
+                peers[key]?.lastCall = .distantPast
+                scheduleInvitation(key)
+            }
         } else if Discovery.isPacket(packet) {
             await receiveDiscovery(packet, endpoint: endpoint, relaySource: nil)
         } else {
             let now = Date()
+            var delivered = 0
             for (key, peer) in peers {
                 guard let authenticated = peer.inbound[endpoint], now.timeIntervalSince(authenticated) < 120 else { continue }
                 // An endpoint can be shared by configured identities. The WireGuard
                 // authentication layer determines which peer owns the datagram.
                 continuation.yield(TransportPacket(source: key, payload: packet, viaRelay: false))
+                delivered += 1
             }
+            TransportDiagnostics.log("receive direct udp=\(udp?.port ?? 0) from=\(endpoint) bytes=\(packet.count) bindings=\(delivered)")
         }
     }
 
@@ -518,70 +825,189 @@ public actor NetworkTransport {
             peer.inbound[oldest] = nil
         }
         peer.inbound[endpoint] = now
+        TransportDiagnostics.log("bind inbound udp=\(udp?.port ?? 0) endpoint=\(endpoint)")
         peers[key] = peer
     }
 
     private func receiveDiscovery(_ packet: Data, endpoint: DiscoveryEndpoint?, relaySource: Data?) async {
         guard let source = Discovery.sourceKey(packet),
               let match = peers.first(where: { $0.value.discoKey == source }),
-              relaySource == nil || relaySource == match.key,
-              let sender = try? Discovery.open(packet, privateKey: discoPrivateKey) else { return }
+              relaySource == nil || relaySource == match.key else { return }
         let key = match.key
+        let generation = networkGeneration, peerGeneration = match.value.generation
+        let secret = discoPrivateKey
+        // Portable NaCl can be costly with many interface candidates. Keep that
+        // work off the routing actor so relay/app sends can proceed concurrently.
+        let sender = try? await Task.detached(priority: .utility) {
+            try Discovery.open(packet, privateKey: secret)
+        }.value
+        if sender == nil { TransportDiagnostics.log("disco open rejected endpoint=\(endpoint?.description ?? "relay")") }
+        guard let sender, !closed, !Task.isCancelled, networkGeneration == generation,
+              peers[key]?.generation == peerGeneration else { return }
         switch sender.message {
         case let .ping(transaction, claimedKey):
-            guard claimedKey == nil || claimedKey == key else { return }
+            guard peers[key]?.directAllowed == true, claimedKey == nil || claimedKey == key else { return }
             if let endpoint, let udp {
+                let newEndpoint = peers[key]?.endpoints.contains(endpoint) == false
                 bindInbound(endpoint, to: key)
                 if peers[key]?.endpoints.count ?? 0 < 128 { peers[key]?.endpoints.insert(endpoint) }
-                if let response = try? Discovery.seal(.pong(transaction: transaction, observed: endpoint), to: sender.source, privateKey: discoPrivateKey) {
+                if let response = try? await sealDiscovery(.pong(transaction: transaction, observed: endpoint), to: sender.source) {
+                    guard !closed, !Task.isCancelled, networkGeneration == generation,
+                          peers[key]?.generation == peerGeneration else { return }
                     try? await udp.send(response, to: endpoint)
                 }
-                if Date().timeIntervalSince(peers[key]?.lastProbe ?? .distantPast) >= 1 { await probe(key) }
+                if newEndpoint { scheduleProbe(key, force: true) }
             }
         case let .pong(transaction, mapped):
-            guard let pending = probes.removeValue(forKey: transaction), pending.peer == key,
-                  pending.endpoint == endpoint, Date().timeIntervalSince(pending.sent) < 10,
-                  let endpoint else { return }
+            guard let pending = probes.removeValue(forKey: transaction) else {
+                TransportDiagnostics.log("pong unmatched udp=\(udp?.port ?? 0) from=\(endpoint?.description ?? "relay")")
+                return
+            }
+            guard pending.peer == key,
+                  pending.generation == peers[key]?.generation,
+                  Date().timeIntervalSince(pending.sent) < 10,
+                  let endpoint else {
+                TransportDiagnostics.log("pong stale/mismatch udp=\(udp?.port ?? 0) expected=\(pending.endpoint) actual=\(endpoint?.description ?? "relay") age=\(Date().timeIntervalSince(pending.sent))")
+                return
+            }
+            guard pending.endpoint == endpoint else {
+                // A bound-any peer can reply from another local address. That
+                // address is only a candidate: issue a new challenge to it.
+                if endpoint.port != 0, peers[key]?.endpoints.contains(endpoint) == false,
+                   peers[key]?.endpoints.count ?? 128 < 128 {
+                    peers[key]?.endpoints.insert(endpoint)
+                    scheduleProbe(key, force: true)
+                }
+                TransportDiagnostics.log("pong alternate source challenged expected=\(pending.endpoint) actual=\(endpoint)")
+                return
+            }
             bindInbound(endpoint, to: key)
-            peers[key]?.direct = endpoint; peers[key]?.verified = Date()
+            // A late reply from an alternate interface must not churn a healthy
+            // selected route. Only its own Pong renews that route's lifetime.
+            if let peer = peers[key], peer.direct == nil || peer.direct == endpoint ||
+                Date().timeIntervalSince(peer.verified) >= 30 ||
+                (peer.invitedEndpoints.contains(endpoint) && peer.direct.map { !peer.invitedEndpoints.contains($0) } == true) {
+                TransportDiagnostics.log("select direct udp=\(udp?.port ?? 0) old=\(peer.direct?.description ?? "relay") new=\(endpoint)")
+                peers[key]?.direct = endpoint; peers[key]?.verified = Date()
+                startupTrace?.record("directVerified")
+            }
             observed[mapped] = Date()
         case let .callMeMaybe(endpoints):
             // Only the relay's authenticated source can authorize endpoint invitations.
             guard relaySource == key, endpoint == nil else { return }
+            startupTrace?.record("authenticatedInvitationReceived", detail: String(endpoints.count))
+            let invited = Set(endpoints.prefix(128).filter { $0.port != 0 })
+            let previous = peers[key]?.invitedEndpoints ?? []
+            let changed = !invited.isEmpty && previous != invited
+            if !invited.isEmpty {
+                let withdrawn = previous.subtracting(invited)
+                if !withdrawn.isEmpty {
+                    // Also retire challenges while already on relay or after a
+                    // new route won. Detached sealing must not publish an old
+                    // endpoint's nonce after this authenticated withdrawal.
+                    invalidateProbes(to: key)
+                    peers[key]?.endpoints.subtract(withdrawn)
+                    peers[key]?.lastProbe = .distantPast
+                }
+                if let selected = peers[key]?.direct, withdrawn.contains(selected) {
+                    // The peer explicitly replaced an advertised route. Keep
+                    // encrypted traffic on DERP while validating its new route.
+                    // A fresh challenge may still prove the old route usable.
+                    invalidateDirectPath(to: key)
+                    var candidates = invited
+                    if candidates.count < 128 { candidates.insert(selected) }
+                    peers[key]?.endpoints = candidates
+                    peers[key]?.lastProbe = .distantPast
+                    TransportDiagnostics.log("remote route replaced; fallback relay old=\(selected)")
+                }
+                peers[key]?.invitedEndpoints = invited
+            }
+            TransportDiagnostics.log("invite udp=\(udp?.port ?? 0) endpoints=\(endpoints.map(\.description))")
             for address in endpoints.prefix(128) where address.port != 0 {
                 if peers[key]?.endpoints.count ?? 0 < 128 { peers[key]?.endpoints.insert(address) }
             }
             // The invitation proves the peer is now ready; an earlier UDP probe
             // may have arrived before it registered our discovery key.
-            if Date().timeIntervalSince(peers[key]?.lastInvitation ?? .distantPast) >= 1 {
+            if changed || Date().timeIntervalSince(peers[key]?.lastInvitation ?? .distantPast) >= 1 {
                 peers[key]?.lastInvitation = Date()
-                await probe(key)
+                scheduleProbe(key, force: true)
             }
         }
     }
 
+    private func scheduleProbe(_ key: Data, force: Bool = false) {
+        guard !closed, started, udp != nil, let peer = peers[key], peer.directAllowed else { return }
+        if probeTasks[key] != nil {
+            if force { pendingProbes.insert(key) }
+            return
+        }
+        let delay = max(0, 1 - Date().timeIntervalSince(peer.lastProbe))
+        guard force || delay == 0 else { return }
+        probeTasks[key] = Task { [weak self] in
+            if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
+            guard !Task.isCancelled else { return }
+            await self?.probe(key)
+            await self?.finishProbe(key, generation: peer.generation)
+        }
+    }
+
+    private func finishProbe(_ key: Data, generation: UUID) {
+        if peers[key]?.generation == generation {
+            probeTasks[key] = nil
+            if pendingProbes.remove(key) != nil { scheduleProbe(key, force: true) }
+        }
+    }
+
+    private func scheduleInvitation(_ key: Data) {
+        guard !closed, started, let peer = peers[key], peer.directAllowed, invitationTasks[key] == nil else { return }
+        invitationTasks[key] = Task { [weak self] in
+            await self?.callMeMaybe(key)
+            await self?.finishInvitation(key, generation: peer.generation)
+        }
+    }
+
+    private func finishInvitation(_ key: Data, generation: UUID) {
+        if peers[key]?.generation == generation {
+            invitationTasks[key] = nil
+            if peers[key]?.lastCall == .distantPast { scheduleInvitation(key) }
+        }
+    }
+
     private func probe(_ key: Data) async {
-        guard let peer = peers[key], let udp, let nodePublic = try? NaClBox.publicKey(for: privateKey) else { return }
+        guard let peer = peers[key], !peer.endpoints.isEmpty, let udp,
+              let nodePublic = nodePublicKey else { return }
         peers[key]?.lastProbe = Date()
+        startupTrace?.record("directProbeStarted", detail: String(min(peer.endpoints.count, 128)))
         for endpoint in peer.endpoints.prefix(128) {
-            guard !closed, peers[key]?.generation == peer.generation else { return }
+            guard !closed, !Task.isCancelled, peers[key]?.generation == peer.generation else { return }
             let transaction = NaClBox.random(12)
-            guard let packet = try? Discovery.seal(.ping(transaction: transaction, nodeKey: nodePublic), to: peer.discoKey, privateKey: discoPrivateKey) else { continue }
-            probes[transaction] = Probe(peer: key, endpoint: endpoint, sent: Date())
+            guard let packet = try? await sealDiscovery(.ping(transaction: transaction, nodeKey: nodePublic), to: peer.discoKey) else { continue }
+            guard !closed, !Task.isCancelled, peers[key]?.generation == peer.generation else { return }
+            probes[transaction] = Probe(peer: key, endpoint: endpoint, sent: Date(), generation: peer.generation)
             try? await udp.send(packet, to: endpoint)
         }
     }
 
     private func callMeMaybe(_ key: Data) async {
-        guard let peer = peers[key], Date().timeIntervalSince(peer.lastCall) >= 1 else { return }
+        guard !closed, !Task.isCancelled, let peer = peers[key], Date().timeIntervalSince(peer.lastCall) >= 1 else { return }
         peers[key]?.lastCall = Date()
         let endpoints = localEndpoints().prefix(128).compactMap { try? DiscoveryEndpoint($0) }
-        guard let packet = try? Discovery.seal(.callMeMaybe(endpoints), to: peer.discoKey, privateKey: discoPrivateKey) else { return }
+        guard let packet = try? await sealDiscovery(.callMeMaybe(endpoints), to: peer.discoKey),
+              !closed, !Task.isCancelled, peers[key]?.generation == peer.generation else { return }
         try? await relay.send(to: key, packet: packet)
     }
 
+    private func sealDiscovery(_ message: DiscoveryMessage, to key: Data) async throws -> Data {
+        let secret = discoPrivateKey
+        return try await Task.detached(priority: .utility) {
+            try Discovery.seal(message, to: key, privateKey: secret)
+        }.value
+    }
+
     private func maintain() async {
-        guard !closed else { return }
+        guard !closed, !Task.isCancelled else { return }
+        if udp == nil { scheduleDiscovery() }
+        let generation = networkGeneration
         let now = Date()
         probes = probes.filter { now.timeIntervalSince($0.value.sent) < 10 }
         stun = stun.filter { now.timeIntervalSince($0.value.sent) < 10 }
@@ -594,14 +1020,15 @@ public actor NetworkTransport {
         if now.timeIntervalSince(lastSTUN) >= 30, let udp {
             lastSTUN = now
             for endpoint in stunServers {
+                guard !closed, !Task.isCancelled, networkGeneration == generation else { return }
                 let transaction = NaClBox.random(12)
                 stun[transaction] = (endpoint, now)
                 if let packet = try? STUN.request(transaction: transaction) { try? await udp.send(packet, to: endpoint) }
             }
         }
         for (key, peer) in peers {
-            if now.timeIntervalSince(peer.lastProbe) >= 10 { await probe(key) }
-            if now.timeIntervalSince(peer.lastCall) >= 25 { await callMeMaybe(key) }
+            if now.timeIntervalSince(peer.lastProbe) >= 10 { scheduleProbe(key) }
+            if now.timeIntervalSince(peer.lastCall) >= 25 { scheduleInvitation(key) }
         }
     }
 }

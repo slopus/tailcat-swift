@@ -4,4 +4,5 @@
 .context/
 DerivedData/
 .bsp/
+Examples/TailcatBenchApp/*.xcodeproj/
 xtool/

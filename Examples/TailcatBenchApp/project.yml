@@ -1,0 +1,25 @@
+name: TailcatBenchApp
+options:
+  bundleIdPrefix: dev.happy.tailcatbench
+packages:
+  TailcatSwift:
+    path: ../..
+targets:
+  TailcatBenchApp:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources: [Sources]
+    dependencies:
+      - package: TailcatSwift
+        product: TailcatBenchmark
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.happy.tailcatbench.relayfirst
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: Tailcat benchmark validates direct peer connections on this network.
+        CODE_SIGN_STYLE: Automatic
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1,2"

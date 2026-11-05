@@ -92,6 +92,95 @@ report the current route. DERP reconnects and tries alternate nodes in the adver
 region. `TailcatAddress.resolved()` embeds relay details; compact addresses use a fetched
 DERP map with one-hour caching, ETag revalidation, and stale-cache fallback.
 
+### Optional relay-first connections
+
+Set `relayFirst` on either or both peers to establish the encrypted session over DERP
+without waiting for UDP binding, interface enumeration, or STUN discovery. The default
+remains `false`; peers using either setting interoperate without a wire-format change.
+
+```swift
+var serverOptions = TailcatServer.Configuration()
+serverOptions.relayFirst = true
+let server = TailcatServer(configuration: serverOptions)
+let listener = try await server.listen(port: 8080)
+let address = try await server.address
+
+var clientOptions = TailcatClient.Configuration()
+clientOptions.relayFirst = true
+let client = try await TailcatClient.connect(to: address, configuration: clientOptions)
+let stream = try await client.openTCP(port: 8080)
+
+await client.retryDirect()                  // Background probe; keep the current route.
+await server.retryDirect(to: client.publicKey) // Omit `to:` to probe all peers.
+await client.notifyNetworkChanged()         // Discard stale routes and rebind/reconnect.
+await server.notifyNetworkChanged()
+// resetNetworkPaths() is an alias for notifyNetworkChanged().
+```
+
+When the app needs one tunnel to a known peer, it can retain a connected client and
+reuse it for `openTCP` calls or keep a stream open.
+The client keeps its DERP connection open, including while data uses direct UDP;
+opening another stream does not reconnect to the relay. Close the client when the
+app no longer needs that connection. There is no separate shared-node or relay-pool
+API, and `relayFirst` does not eliminate initial TCP/TLS, relay authentication, or
+WireGuard setup for a newly created client.
+
+Apps that need independent relay connections can call `connect(to:)` again while the
+first client is alive. Each call still owns its node/discovery identity (unless an
+explicit private key is supplied), WireGuard session, UDP socket and DERP connection.
+Do not supply the same private key to concurrently independent clients: their relay
+identities would collide. There is no traffic pooling or shared encryption state.
+Where a verified TLS 1.3 relay
+advertises DERP fast start, the new socket sends its HTTP upgrade and fresh ClientInfo
+together, removing a handshake round trip. Older relays use the ordinary upgrade;
+a failed fast-start attempt retries once on a fresh ordinary socket and disables fast
+start for that transport. Client completion is signalled by authenticated WireGuard
+establishment, without a 100 ms polling delay. These changes need no new public option
+and preserve the `relayFirst` default and authentication rules.
+
+The default benchmark's cold samples create a fresh client. Warm samples open a second TCP stream
+on the existing client and WireGuard session. Both differ from message RTT on an
+already-open stream, which does not include another TCP handshake. Use the benchmark's
+`--second-independent` mode to measure a second separate client in the same process.
+
+Client connection completion still requires an authenticated WireGuard session, not just
+a relay socket. After initial encrypted confirmation, discovery can upgrade the same
+session and open streams to UDP only after an authenticated, transaction-matched Pong.
+`client.path` and `server.path(to:)` expose the selected route. Relay reception stays
+active while direct is selected; a relay outage does not itself close a working direct
+session. No API forces an unvalidated endpoint into service.
+
+An authenticated changed endpoint announcement can retire an obsolete direct route.
+After a local network reset, failed UDP send or expired selected route, an established
+peer sends an encrypted empty WireGuard transport packet over DERP before further
+application traffic. This existing keepalive format tells the peer to retire its old
+route and revalidate, without waiting for STUN or a new endpoint announcement. Initial
+handshake confirmations, unauthenticated packets and older reset-marker counters cannot
+trigger that fallback. Ordinary relayed application packets do not demote a direct
+route, so asymmetric promotion does not cause repeated path switching. Receiving a
+reset hint does not send another hint back. This uses existing wire messages, not a
+new packet type; peers without this recovery behavior simply process the keepalive.
+Prompt one-sided return-route recovery requires an updated peer. An older library
+still interoperates, but uses its existing discovery/liveness behavior after a reset;
+it does not interpret the keepalive as a route-withdrawal notification.
+
+Apple's `NWPathMonitor` automatically requests recovery when its path signature changes.
+Apps can also call `notifyNetworkChanged()` after resume or network events the monitor
+does not distinguish; non-Apple hosts must supply those notifications themselves. It
+clears remote candidates, inbound endpoint bindings and pending probes, rebinds UDP,
+reconnects DERP, and discovers fresh paths without replacing the WireGuard/IP-stack session.
+`retryDirect()` only requests a probe and does not invalidate a healthy route. Repeated
+requests coalesce; shutdown prevents late discovery results from installing routes.
+
+UDP send errors immediately fall back to DERP. Silent loss falls back once the last
+validated Pong is 30 seconds old; direct probes run about every 10 seconds, and ordinary
+sends do not extend that deadline. Failed UDP setup retries on the five-second maintenance
+tick. DERP reconnect uses exponential backoff capped at 30 seconds. A blocked OS lookup
+can delay later direct discovery (only one discovery worker is retained), but not relay
+traffic in relay-first mode. Startup still needs a usable relay and may need address-map
+resolution; this is not an offline connection guarantee. TCP retransmission can bridge
+brief route changes, but long outages can time out; UDP datagrams are not made reliable.
+
 Run native protocol tests on Linux or macOS:
 
 ```sh

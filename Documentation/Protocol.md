@@ -8,7 +8,7 @@ The implementation is native Swift and has no third-party package dependencies.
 | `wire.go`, `ConnInfo`, `Addr` | Bounded CBOR and unpadded base64url with `tc` prefix; fields `p`, `k`, `q`, `r`, `i`; embedded node fields and elided IDs/names restored |
 | Node and discovery keys | Curve25519; discovery private key derived with HMAC-SHA256 over `github.com/tailscale/tailcat disco key v1`, then clamped; IPv6 is `fd7a:115c:a1e0::/48` plus the first ten node-public-key bytes |
 | DERP map expansion | Embedded/custom regions, region ID lookup, automatic HTTPS-latency selection with fallback; configurable map URL and cache, one-hour freshness, ETag and stale fallback |
-| DERP | TLS HTTP upgrade, authenticated NaCl client/server info, bounded frame codec, ping/pong, keepalive, restart and peer-gone frames, token bucket, reconnect and region-node failover |
+| DERP | TLS HTTP upgrade; existing fast-start capability from verified TLS 1.3 peer metadata; authenticated NaCl client/server info; bounded frame codec, ping/pong, keepalive, restart and peer-gone frames, token bucket, reconnect and region-node failover |
 | Bootstrap | Raw `meow` ping and `meowed` acknowledgement always travel over DERP; advertised identity must match the authenticated relay source; zero discovery keys rejected |
 | Discovery | `TS💬` wrapper and NaCl box; ping/pong transaction correlation, relay-bound CallMeMaybe, IPv4/IPv6 endpoint exchange, STUN XOR-mapped addresses, periodic probes and relay fallback |
 | WireGuard | Noise IKpsk2, BLAKE2s, Curve25519, ChaCha20-Poly1305, MAC1/MAC2, XChaCha cookie replies, TAI64N replay checks, overlapping current/previous/next keypairs, 8,192-packet replay window, rekey and persistent keepalive |
@@ -62,6 +62,14 @@ it never enables production plaintext relay connections. The upstream echo fixtu
 reference generators are verification tools, excluded from the Swift package and Git.
 Apple runtime behavior still requires an actual iOS/macOS device; xtool cross-builds
 validate Apple SDK compilation and package the SwiftUI embedding example on Linux.
+
+Relay-first lifecycle tests use an in-process, authenticated DERP fixture and real loopback
+UDP, WireGuard and TCP. They cover mixed default/relay-first peers, blocked UDP/STUN
+discovery, same-stream upgrade and network recovery, direct operation during relay loss,
+relay reconnection, failed UDP sends, coalesced notifications and stale discovery cleanup.
+The optional mode changes scheduling and path lifecycle only, not cryptography or framing.
+See the README for public APIs and fallback timing. These new tests do not replace Apple
+runtime or external upstream interoperability testing.
 
 Validation on Linux with Swift 6.4.1 and xtool's Darwin SDK:
 

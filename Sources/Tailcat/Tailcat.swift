@@ -8,6 +8,9 @@ public actor TailcatServer {
         public var privateKey: NodePrivateKey?
         public var presharedKey: PresharedKey?
         public var disablePresharedKey = false
+        /// Start over DERP without waiting for UDP setup; discover direct paths in the background.
+        public var relayFirst = false
+        var directDiscovery = DirectDiscovery()
         public var region: DERPRegion?
         public var regionID = -1
         public var mapURL = DERPMap.defaultURL
@@ -89,8 +92,11 @@ public actor TailcatServer {
     public func path(to key: NodePublicKey) async throws -> ConnectionPath {
         guard let engine else { throw TailcatError.notStarted }; return await engine.path(to: key)
     }
-    /// Call after an app observes an interface change to immediately return traffic to DERP.
-    public func resetNetworkPaths() async { await engine?.resetNetworkPaths() }
+    /// Probe without dropping an existing route or encrypted session. Nil targets all peers.
+    public func retryDirect(to key: NodePublicKey? = nil) async { await engine?.retryDirect(to: key) }
+    /// Discard old network paths, rebind UDP and reconnect DERP, preserving encrypted sessions.
+    public func notifyNetworkChanged() async { await engine?.notifyNetworkChanged() }
+    public func resetNetworkPaths() async { await notifyNetworkChanged() }
     /// The server's own TCP flows (its listeners' and those it opened);
     /// zero before it starts. Forwarded flows are not counted.
     public var flowStatistics: TailcatFlowStatistics {
@@ -115,6 +121,10 @@ public actor TailcatClient {
         public var mapURL = DERPMap.defaultURL
         public var mapCache: any DERPMapCache = MemoryDERPMapCache.shared
         public var connectTimeout: TimeInterval = 30
+        /// Start over DERP without waiting for UDP setup; discover direct paths in the background.
+        public var relayFirst = false
+        var directDiscovery = DirectDiscovery()
+        package var startupTrace: StartupTrace?
         public init() {}
     }
     private let engine: TailcatEngine
@@ -137,15 +147,24 @@ public actor TailcatClient {
         }
     }
     private static func connectPrepared(to address: TailcatAddress, configuration: Configuration) async throws -> TailcatClient {
+        let trace = configuration.startupTrace
+        trace?.record("connectStarted")
         let key = try configuration.privateKey ?? NodePrivateKey.generate()
+        trace?.record("identityGenerated")
         let expanded = try await address.expanded(mapURL: configuration.mapURL, cache: configuration.mapCache)
+        trace?.record("addressExpanded")
         guard let disco = expanded.serverDiscoPublicKey, disco.count == 32, disco.contains(where: { $0 != 0 }) else {
             throw TailcatError.invalidAddress("server discovery key is required")
         }
-        let engine = try TailcatEngine(key: key, address: expanded, server: false)
+        var transportConfiguration = TailcatServer.Configuration()
+        transportConfiguration.relayFirst = configuration.relayFirst
+        transportConfiguration.directDiscovery = configuration.directDiscovery
+        let engine = try TailcatEngine(key: key, address: expanded, server: false, configuration: transportConfiguration, startupTrace: trace)
         do {
             try await engine.start()
+            trace?.record("engineStarted")
             try await engine.connect(timeout: configuration.connectTimeout)
+            trace?.record("connectReturned")
             return TailcatClient(engine: engine, address: expanded, publicKey: try key.publicKey)
         } catch { await engine.close(); throw error }
     }
@@ -163,8 +182,12 @@ public actor TailcatClient {
         return TailcatUDPConnection(socket: socket, peer: serverAddress.serverPublicKey.address, port: port)
     }
     public func close() async { await engine.close() }
+    package var discoveryPublicKey: Data { get async throws { try await engine.discoveryPublicKey } }
     public var path: ConnectionPath { get async { await engine.path(to: serverAddress.serverPublicKey) } }
-    public func resetNetworkPaths() async { await engine.resetNetworkPaths() }
+    /// Request a background probe without disrupting the current route or session.
+    public func retryDirect() async { await engine.retryDirect(to: serverAddress.serverPublicKey) }
+    public func notifyNetworkChanged() async { await engine.notifyNetworkChanged() }
+    public func resetNetworkPaths() async { await notifyNetworkChanged() }
     /// This client's TCP flows to the server, open and closing, against
     /// the budgets in `TailcatFlowStatistics`.
     public var flowStatistics: TailcatFlowStatistics { get async { await engine.flowStatistics() } }
@@ -184,6 +207,8 @@ internal actor TailcatEngine {
     private var admitting: [Data: (UUID, Task<Void, Never>)] = [:]
     private var reader: Task<Void, Never>?
     private var timer: Task<Void, Never>?
+    private var connectionWaiter: (id: UUID, continuation: CheckedContinuation<Void, Error>)?
+    private var connectionDeadline: Task<Void, Never>?
     private var closed = false
     private var explicitTCPPorts: Set<UInt16> = []
     private var explicitUDPPorts: Set<UInt16> = []
@@ -210,13 +235,19 @@ internal actor TailcatEngine {
         var authenticated = false
         var lastReceived = Date()
     }
-    init(key: NodePrivateKey, address: TailcatAddress, server: Bool, configuration: TailcatServer.Configuration = .init()) throws {
+    private let startupTrace: StartupTrace?
+    var discoveryPublicKey: Data { get throws { try key.discoPublicKey } }
+    init(key: NodePrivateKey, address: TailcatAddress, server: Bool, configuration: TailcatServer.Configuration = .init(), startupTrace: StartupTrace? = nil) throws {
         guard address.regions.first?.nodes.contains(where: { !$0.stunOnly }) == true else { throw TailcatError.noRelay }
         self.key = key; self.publicKey = try key.publicKey; self.address = address
         self.server = server; self.configuration = configuration; self.allowClient = configuration.allowClient
-        self.network = NetworkTransport(privateKey: key.rawValue, discoPrivateKey: key.discoPrivateKey, relayNodes: address.regions[0].nodes.filter { !$0.stunOnly })
+        self.startupTrace = startupTrace
+        self.network = NetworkTransport(privateKey: key.rawValue, discoPrivateKey: key.discoPrivateKey, relayNodes: address.regions[0].nodes.filter { !$0.stunOnly }, relayFirst: configuration.relayFirst, discovery: configuration.directDiscovery, deferDirectUntilAuthenticated: configuration.relayFirst, startupTrace: startupTrace)
     }
     func start() async throws {
+        await network.setRelayMarkerProvider { [weak self] node in
+            try await self?.makeRelayResetMarker(to: node)
+        }
         stack = IPStack(address: publicKey.address) { [weak self] packet in
             guard let self else { throw TailcatError.closed }; try await self.sendIP(packet)
         }
@@ -242,15 +273,45 @@ internal actor TailcatEngine {
         try WireGuard(privateKey: key.rawValue, peerPublicKey: peer, presharedKey: address.presharedKey?.rawValue ?? Data(repeating: 0, count: 32))
     }
     func connect(timeout: TimeInterval) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while !closed {
-            try Task.checkCancellation()
-            if peers[address.serverPublicKey.rawValue]?.wireguard.isEstablished == true { return }
-            guard Date() < deadline else { throw TailcatError.timedOut }
-            try await tickThrowing()
-            try await Task.sleep(nanoseconds: 100_000_000)
-        }
-        throw TailcatError.closed
+        try Task.checkCancellation()
+        guard !closed else { throw TailcatError.closed }
+        guard timeout > 0, timeout.isFinite else { throw TailcatError.timedOut }
+        if peers[address.serverPublicKey.rawValue]?.wireguard.isEstablished == true { return }
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
+        try await tickThrowing()
+        let id = UUID()
+        try await withTaskCancellationHandler(operation: {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                // tickThrowing can suspend while the reader authenticates the
+                // handshake. Recheck before installing the one bounded waiter.
+                if Task.isCancelled { continuation.resume(throwing: CancellationError()); return }
+                if closed { continuation.resume(throwing: TailcatError.closed); return }
+                if peers[address.serverPublicKey.rawValue]?.wireguard.isEstablished == true {
+                    continuation.resume(); return
+                }
+                guard connectionWaiter == nil else { continuation.resume(throwing: TailcatError.alreadyStarted); return }
+                let remaining = deadline - ProcessInfo.processInfo.systemUptime
+                guard remaining > 0 else { continuation.resume(throwing: TailcatError.timedOut); return }
+                connectionWaiter = (id, continuation)
+                startupTrace?.record("connectionWaiterInstalled")
+                connectionDeadline = Task { [weak self] in
+                    do { try await Task.sleep(nanoseconds: UInt64(min(remaining * 1_000_000_000, Double(UInt64.max / 2)))) }
+                    catch { return }
+                    await self?.finishConnection(.failure(TailcatError.timedOut), id: id)
+                }
+            }
+        }, onCancel: {
+            Task { await self.finishConnection(.failure(CancellationError()), id: id) }
+        })
+        try Task.checkCancellation()
+        guard !closed else { throw TailcatError.closed }
+    }
+    private func finishConnection(_ result: Result<Void, Error>, id: UUID? = nil) {
+        guard let waiter = connectionWaiter, id == nil || waiter.id == id else { return }
+        connectionWaiter = nil
+        connectionDeadline?.cancel(); connectionDeadline = nil
+        startupTrace?.record("connectionWaiterResolved")
+        waiter.continuation.resume(with: result)
     }
     func listen(port: UInt16) async throws -> TailcatListener {
         guard !closed else { throw TailcatError.closed }
@@ -283,7 +344,8 @@ internal actor TailcatEngine {
         return nil
     }
     func path(to key: NodePublicKey) async -> ConnectionPath { await network.path(to: key.rawValue) }
-    func resetNetworkPaths() async { await network.resetDirectPaths() }
+    func retryDirect(to key: NodePublicKey?) async { await network.retryDirect(to: key?.rawValue) }
+    func notifyNetworkChanged() async { await network.notifyNetworkChanged() }
     func flowStatistics() async -> TailcatFlowStatistics {
         guard let stack else { return TailcatFlowStatistics(open: 0, closing: 0) }
         return await stack.flowStatistics
@@ -298,6 +360,7 @@ internal actor TailcatEngine {
     }
     func close() async {
         guard !closed else { return }; closed = true
+        finishConnection(.failure(TailcatError.closed))
         reader?.cancel(); timer?.cancel(); selectedTCPHandlers.removeAll()
         for (_, task) in admitting.values { task.cancel() }; admitting.removeAll()
         for task in handlerTasks.values { task.cancel() }; handlerTasks.removeAll()
@@ -324,22 +387,32 @@ internal actor TailcatEngine {
                 }
                 admitting[node] = (attempt, task)
             } else if !server, data.count >= 5, data[4] == 2, packet.source == address.serverPublicKey.rawValue {
+                startupTrace?.record("meowAcknowledged")
                 peers[packet.source]?.acknowledged = true
                 try? await tickThrowing()
             }
             return
         }
         guard var peer = peers[packet.source] else { return }
+        let previouslyAuthenticated = peer.authenticated
         do {
             let result = try peer.wireguard.receive(data)
+            if result.handshakeCompleted { startupTrace?.record("wireGuardEstablished") }
             if WireGuard.packetType(data) == 4, peer.wireguard.isEstablished {
                 peer.authenticated = true; peer.lastReceived = Date()
             }
             peers[packet.source] = peer
+            if !server, peer.wireguard.isEstablished { finishConnection(.success(())) }
+            if WireGuard.packetType(data) == 4, data.count == 32 {
+                // WireGuard represents an authenticated empty keepalive as nil
+                // plaintext. A 32-byte type-4 packet has no encrypted IP bytes.
+                await observeTransportPacket(packet, allowFallback: previouslyAuthenticated && !result.handshakeCompleted)
+            }
             if let response = result.response { try await network.send(to: packet.source, packet: response) }
             if result.handshakeCompleted {
                 // An empty authenticated transport packet confirms responder key promotion.
-                try await sendPayload(Data(), to: packet.source)
+                if result.response == nil { try await sendPayload(Data(), to: packet.source) }
+                await network.allowDirect(to: packet.source)
                 await flush(packet.source)
             }
             if let plaintext = result.plaintext, !plaintext.isEmpty {
@@ -349,10 +422,27 @@ internal actor TailcatEngine {
                 let length = 40 + Int(plaintext[4]) * 256 + Int(plaintext[5])
                 guard length <= plaintext.count, length <= 1280 else { return }
                 let ip = Data(plaintext.prefix(length))
+                await observeTransportPacket(packet, allowFallback: false)
+                if ip.count >= 60, ip[6] == 6 {
+                    TransportDiagnostics.log("TCP receive server=\(server) relay=\(packet.viaRelay) flags=\(ip[53]) bytes=\(ip.count) seq=\(Array(ip[44..<48])) ack=\(Array(ip[48..<52]))")
+                }
                 if server { await deliverServerIP(ip) }
                 else if Data(ip[24..<40]) == publicKey.address { await stack.receive(ip) }
             }
-        } catch { /* Authentication failures and replayed datagrams are discarded. */ }
+        } catch { TransportDiagnostics.log("WG reject server=\(server) relay=\(packet.viaRelay) bytes=\(data.count) error=\(error)") }
+    }
+
+    private func observeTransportPacket(_ packet: TransportPacket, allowFallback: Bool) async {
+        // The caller has already authenticated this type-4 packet. These are
+        // existing public WireGuard header fields, not a new wire message.
+        let header = packet.payload
+        guard header.count >= 16 else { return }
+        let counter = header[8..<16].enumerated().reduce(UInt64(0)) { result, byte in
+            result | (UInt64(byte.element) << (byte.offset * 8))
+        }
+        await network.observeAuthenticatedTransport(from: packet.source, viaRelay: packet.viaRelay,
+                                                     receiver: Data(header[4..<8]), counter: counter,
+                                                     allowFallback: allowFallback && counter > 0)
     }
     private func admit(_ identity: NodePublicKey, disco: Data, attempt: UUID) async {
         let node = identity.rawValue
@@ -478,6 +568,18 @@ internal actor TailcatEngine {
         guard !closed, let handler else { await connection.close(); return }
         Task { await handler(connection) }
     }
+    private func makeRelayResetMarker(to node: Data) throws -> Data? {
+        guard !closed, var peer = peers[node], peer.authenticated, peer.wireguard.isEstablished else { return nil }
+        var encrypted = try peer.wireguard.encrypt(Data())
+        if encrypted[8..<16].allSatisfy({ $0 == 0 }) {
+            // Counter zero remains a key-confirmation packet, even if reset
+            // preparation races the responder's first outbound confirmation.
+            encrypted = try peer.wireguard.encrypt(Data())
+        }
+        peer.lastSend = Date(); peers[node] = peer
+        return encrypted
+    }
+
     private func sendPayload(_ packet: Data, to node: Data) async throws {
         guard var peer = peers[node] else { throw TailcatError.peerRejected }
         let encrypted = try peer.wireguard.encrypt(packet)
@@ -516,7 +618,9 @@ internal actor TailcatEngine {
             if now.timeIntervalSince(peer.lastMeow) >= 1 {
                 peer.lastMeow = now; peers[address.serverPublicKey.rawValue] = peer
                 let meow = Data("meow\u{01}".utf8) + publicKey.rawValue + (try key.discoPublicKey)
+                startupTrace?.record("meowSendStarted")
                 try await network.send(to: address.serverPublicKey.rawValue, packet: meow)
+                startupTrace?.record("meowWritten")
             }
         }
         for node in Array(peers.keys) {
@@ -527,6 +631,7 @@ internal actor TailcatEngine {
                 if server && !peer.wireguard.isEstablished { continue }
                 let handshake = try peer.wireguard.initiateHandshake(now: now)
                 peer.lastHandshake = now; peers[node] = peer
+                startupTrace?.record("wireGuardInitiationSendStarted")
                 try await network.send(to: node, packet: handshake)
             } else if peer.wireguard.isEstablished, now.timeIntervalSince(peer.lastSend) >= 25 { try await sendPayload(Data(), to: node) }
             } catch { if !server { throw error } }
