@@ -563,11 +563,14 @@ public actor DERPTransport {
 
     private func keepaliveLoop(_ connection: DERPStream, id: UUID) async {
         do {
+            // The server's own keepalive (type 6) comes every 60 s. A ping goes
+            // only when that has gone missing, at the shared idle marks.
             while !Task.isCancelled, !closed, generation == id {
-                try await Task.sleep(nanoseconds: 30_000_000_000)
+                try await Task.sleep(nanoseconds: UInt64(IdleGrid.untilNextMark() * 1_000_000_000))
                 guard generation == id, !closed else { return }
-                guard Date().timeIntervalSince(lastReceived) < 120 else { throw TransportError.timeout }
-                try await connection.send(DERPFrame.encode(type: 0x12, payload: NaClBox.random(8)))
+                let silent = Date().timeIntervalSince(lastReceived)
+                guard silent < 120 else { throw TransportError.timeout }
+                if silent >= 70 { try await connection.send(DERPFrame.encode(type: 0x12, payload: NaClBox.random(8))) }
             }
         } catch { if !Task.isCancelled { failed(id: id) } }
     }

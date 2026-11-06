@@ -323,6 +323,9 @@ public actor NetworkTransport {
         var lastProbe = Date.distantPast
         var lastCall = Date.distantPast
         var lastInvitation = Date.distantPast
+        /// The last WireGuard packet carrying application bytes, either way.
+        /// Keepalives, handshakes and discovery don't count.
+        var lastActivity = Date.distantPast
         var generation = UUID()
         // Receive bindings are independent of our preferred outbound path.
         var inbound = [DiscoveryEndpoint: Date]()
@@ -402,8 +405,8 @@ public actor NetworkTransport {
             #endif
             maintenance = Task { [weak self] in
                 while !Task.isCancelled {
-                    await self?.maintain()
-                    do { try await Task.sleep(nanoseconds: 5_000_000_000) } catch { break }
+                    guard let delay = await self?.maintain() else { break }
+                    do { try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) } catch { break }
                 }
             }
             scheduleDiscovery()
@@ -727,10 +730,19 @@ public actor NetworkTransport {
             try await relay.send(to: nodeKey, packet: packet)
             return
         }
+        let carries = Self.carriesData(packet)
+        if carries { peers[nodeKey]?.lastActivity = Date() }
         if packet.count <= UDPIngress.maximumDatagramSize, let peer = peers[nodeKey], peer.directAllowed, let direct = peer.direct,
-           Date().timeIntervalSince(peer.verified) < 30, let udp {
+           Date().timeIntervalSince(peer.verified) < Self.directLifetime, let udp {
             TransportDiagnostics.log("send direct udp=\(udp.port) to=\(direct) bytes=\(packet.count) type=\(WireGuard.packetType(packet) ?? 0)")
-            do { try await udp.send(packet, to: direct); return }
+            do {
+                try await udp.send(packet, to: direct)
+                // Renew the route in use while it carries data, in the same burst
+                // of radio activity, rather than probing every route on a timer.
+                if carries, Date().timeIntervalSince(peer.verified) >= Self.renewAfter,
+                   Date().timeIntervalSince(peer.lastProbe) >= 5 { scheduleProbe(nodeKey, only: direct) }
+                return
+            }
             catch {
                 if peers[nodeKey]?.generation == peer.generation {
                     invalidateDirectPath(to: nodeKey)
@@ -738,16 +750,40 @@ public actor NetworkTransport {
                 }
             }
         }
-        if let peer = peers[nodeKey], peer.direct != nil, Date().timeIntervalSince(peer.verified) >= 30 {
+        if let peer = peers[nodeKey], peer.direct != nil, Date().timeIntervalSince(peer.verified) >= Self.directLifetime {
             invalidateDirectPath(to: nodeKey)
             requestRelayMarker(to: nodeKey)
         }
         try await sendPendingRelayMarker(to: nodeKey)
         TransportDiagnostics.log("send relay udp=\(udp?.port ?? 0) bytes=\(packet.count) type=\(WireGuard.packetType(packet) ?? 0)")
         try await relay.send(to: nodeKey, packet: packet)
-        if let peer = peers[nodeKey], Date().timeIntervalSince(peer.lastProbe) >= 5 {
+        // Only data looks for a direct route: an idle keepalive or rekey over
+        // the relay leaves the radio alone after it.
+        if carries, let peer = peers[nodeKey], Date().timeIntervalSince(peer.lastProbe) >= 5 {
             scheduleProbe(nodeKey); scheduleInvitation(nodeKey)
         }
+    }
+
+    /// How long a Pong keeps a direct route usable.
+    static let directLifetime: TimeInterval = 30
+    /// A route in use is renewed once its last Pong is this old.
+    static let renewAfter: TimeInterval = 20
+    /// A peer with no data either way for this long is idle: nothing is
+    /// probed, invited or STUNned for it until data moves again.
+    static let idleAfter: TimeInterval = 30
+
+    /// A WireGuard transport packet with encrypted bytes in it: not a
+    /// handshake, and not the 32-byte empty keepalive.
+    static func carriesData(_ packet: Data) -> Bool {
+        WireGuard.packetType(packet) == 4 && packet.count > 32
+    }
+
+    private func active(_ peer: Peer, now: Date) -> Bool {
+        now.timeIntervalSince(peer.lastActivity) < Self.idleAfter
+    }
+
+    private func directVerified(_ peer: Peer, now: Date) -> Bool {
+        peer.direct != nil && now.timeIntervalSince(peer.verified) < Self.directLifetime
     }
 
     public func localEndpoints() -> [String] {
@@ -782,6 +818,7 @@ public actor NetworkTransport {
             await receiveDiscovery(packet.payload, endpoint: nil, relaySource: packet.source)
         } else {
             TransportDiagnostics.log("receive relay udp=\(udp?.port ?? 0) bytes=\(packet.payload.count) type=\(WireGuard.packetType(packet.payload) ?? 0)")
+            if Self.carriesData(packet.payload) { peers[packet.source]?.lastActivity = Date() }
             continuation.yield(TransportPacket(source: packet.source, payload: packet.payload, viaRelay: true))
         }
     }
@@ -797,8 +834,13 @@ public actor NetworkTransport {
             guard let pending = stun[transaction], pending.endpoint == endpoint,
                   Date().timeIntervalSince(pending.sent) < 10,
                   let mapped = try? STUN.response(packet, transaction: transaction) else { return }
-            stun[transaction] = nil; observed[mapped] = Date()
-            for key in peers.keys {
+            stun[transaction] = nil
+            let fresh = observed[mapped] == nil
+            observed[mapped] = Date()
+            // A new mapping is news to every peer; otherwise only a peer still
+            // looking for a route is invited again.
+            let now = Date()
+            for (key, peer) in peers where fresh || (active(peer, now: now) && !directVerified(peer, now: now)) {
                 peers[key]?.lastCall = .distantPast
                 scheduleInvitation(key)
             }
@@ -807,8 +849,10 @@ public actor NetworkTransport {
         } else {
             let now = Date()
             var delivered = 0
+            let carries = Self.carriesData(packet)
             for (key, peer) in peers {
                 guard let authenticated = peer.inbound[endpoint], now.timeIntervalSince(authenticated) < 120 else { continue }
+                if carries { peers[key]?.lastActivity = now }
                 // An endpoint can be shared by configured identities. The WireGuard
                 // authentication layer determines which peer owns the datagram.
                 continuation.yield(TransportPacket(source: key, payload: packet, viaRelay: false))
@@ -937,7 +981,7 @@ public actor NetworkTransport {
         }
     }
 
-    private func scheduleProbe(_ key: Data, force: Bool = false) {
+    private func scheduleProbe(_ key: Data, force: Bool = false, only: DiscoveryEndpoint? = nil) {
         guard !closed, started, udp != nil, let peer = peers[key], peer.directAllowed else { return }
         if probeTasks[key] != nil {
             if force { pendingProbes.insert(key) }
@@ -948,7 +992,7 @@ public actor NetworkTransport {
         probeTasks[key] = Task { [weak self] in
             if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
             guard !Task.isCancelled else { return }
-            await self?.probe(key)
+            await self?.probe(key, only: only)
             await self?.finishProbe(key, generation: peer.generation)
         }
     }
@@ -975,12 +1019,14 @@ public actor NetworkTransport {
         }
     }
 
-    private func probe(_ key: Data) async {
+    /// Pings `only` when renewing the route in use, else every candidate.
+    private func probe(_ key: Data, only: DiscoveryEndpoint? = nil) async {
         guard let peer = peers[key], !peer.endpoints.isEmpty, let udp,
               let nodePublic = nodePublicKey else { return }
         peers[key]?.lastProbe = Date()
-        startupTrace?.record("directProbeStarted", detail: String(min(peer.endpoints.count, 128)))
-        for endpoint in peer.endpoints.prefix(128) {
+        let targets = only.map { [$0] } ?? Array(peer.endpoints.prefix(128))
+        startupTrace?.record("directProbeStarted", detail: String(targets.count))
+        for endpoint in targets {
             guard !closed, !Task.isCancelled, peers[key]?.generation == peer.generation else { return }
             let transaction = NaClBox.random(12)
             guard let packet = try? await sealDiscovery(.ping(transaction: transaction, nodeKey: nodePublic), to: peer.discoKey) else { continue }
@@ -1006,8 +1052,13 @@ public actor NetworkTransport {
         }.value
     }
 
-    private func maintain() async {
-        guard !closed, !Task.isCancelled else { return }
+    /// Housekeeping, and route discovery only for peers moving data without a
+    /// verified direct route. Returns how long to sleep: 5 s while any peer
+    /// is active, else until the next shared 30 s mark, so that idle clients
+    /// in one process wake together.
+    private func maintain() async -> TimeInterval {
+        let delay = maintenanceDelay()
+        guard !closed, !Task.isCancelled else { return delay }
         if udp == nil { scheduleDiscovery() }
         let generation = networkGeneration
         let now = Date()
@@ -1019,18 +1070,26 @@ public actor NetworkTransport {
             peer.inbound = peer.inbound.filter { now.timeIntervalSince($0.value) < 120 }
             peers[key] = peer
         }
-        if now.timeIntervalSince(lastSTUN) >= 30, let udp {
+        let seeking = peers.values.contains { active($0, now: now) && !directVerified($0, now: now) && $0.directAllowed }
+        if seeking, now.timeIntervalSince(lastSTUN) >= 30, let udp {
             lastSTUN = now
             for endpoint in stunServers {
-                guard !closed, !Task.isCancelled, networkGeneration == generation else { return }
+                guard !closed, !Task.isCancelled, networkGeneration == generation else { return delay }
                 let transaction = NaClBox.random(12)
                 stun[transaction] = (endpoint, now)
                 if let packet = try? STUN.request(transaction: transaction) { try? await udp.send(packet, to: endpoint) }
             }
         }
-        for (key, peer) in peers {
+        for (key, peer) in peers where active(peer, now: now) && !directVerified(peer, now: now) {
             if now.timeIntervalSince(peer.lastProbe) >= 10 { scheduleProbe(key) }
             if now.timeIntervalSince(peer.lastCall) >= 25 { scheduleInvitation(key) }
         }
+        return delay
+    }
+
+    private func maintenanceDelay() -> TimeInterval {
+        let now = Date()
+        if peers.values.contains(where: { active($0, now: now) }) { return 5 }
+        return IdleGrid.untilNextMark()
     }
 }

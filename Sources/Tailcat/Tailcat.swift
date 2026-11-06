@@ -234,6 +234,8 @@ internal actor TailcatEngine {
         var admittedAt = Date()
         var authenticated = false
         var lastReceived = Date()
+        /// The last packet with application bytes, either way.
+        var lastActivity = Date()
     }
     private let startupTrace: StartupTrace?
     var discoveryPublicKey: Data { get throws { try key.discoPublicKey } }
@@ -263,12 +265,30 @@ internal actor TailcatEngine {
             catch { await self?.close() }
         }
         timer = Task { [weak self] in
+            var delay: TimeInterval = 1
             while !Task.isCancelled {
-                do { try await Task.sleep(nanoseconds: 1_000_000_000) } catch { break }
-                await self?.tick()
+                do { try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) } catch { break }
+                guard let next = await self?.tickAndDelay() else { break }
+                delay = next
             }
         }
     }
+    /// One tick, then how long until the next: every second while anything
+    /// is connecting or moving data, else until the next idle mark.
+    private func tickAndDelay() async -> TimeInterval {
+        await tick()
+        guard !server, !closed else { return 1 }
+        let now = Date()
+        let busy = peers.values.contains {
+            !$0.acknowledged || !$0.wireguard.isEstablished || !$0.pending.isEmpty || now.timeIntervalSince($0.lastActivity) < Self.idleAfter
+        }
+        return busy ? 1 : IdleGrid.untilNextMark()
+    }
+    /// No application bytes either way for this long: keepalives and rekeys
+    /// wait for the shared idle marks.
+    static let idleAfter: TimeInterval = 30
+    /// An idle client's keepalive: the server forgets a peer silent for 300 s.
+    static let idleKeepalive: TimeInterval = 110
     private func newWireGuard(_ peer: Data) throws -> WireGuard {
         try WireGuard(privateKey: key.rawValue, peerPublicKey: peer, presharedKey: address.presharedKey?.rawValue ?? Data(repeating: 0, count: 32))
     }
@@ -416,6 +436,7 @@ internal actor TailcatEngine {
                 await flush(packet.source)
             }
             if let plaintext = result.plaintext, !plaintext.isEmpty {
+                peers[packet.source]?.lastActivity = Date()
                 guard plaintext.count >= 40, plaintext[0] >> 4 == 6,
                       let identity = try? NodePublicKey(rawValue: packet.source),
                       (!server || Data(plaintext[8..<24]) == identity.address) else { return }
@@ -583,7 +604,9 @@ internal actor TailcatEngine {
     private func sendPayload(_ packet: Data, to node: Data) async throws {
         guard var peer = peers[node] else { throw TailcatError.peerRejected }
         let encrypted = try peer.wireguard.encrypt(packet)
-        peer.lastSend = Date(); peers[node] = peer
+        peer.lastSend = Date()
+        if !packet.isEmpty { peer.lastActivity = peer.lastSend }
+        peers[node] = peer
         try await network.send(to: node, packet: encrypted)
     }
     private func flush(_ node: Data) async {
@@ -625,15 +648,19 @@ internal actor TailcatEngine {
         }
         for node in Array(peers.keys) {
             guard var peer = peers[node], peer.acknowledged else { continue }
+            // An idle client rekeys and keeps alive only at the shared marks: a
+            // session is never older than 150 s there, inside WireGuard's 180.
+            let idle = !server && now.timeIntervalSince(peer.lastActivity) >= Self.idleAfter
+            let due = !idle || IdleGrid.atMark()
             do {
-            if (!peer.wireguard.isEstablished || peer.wireguard.needsRekey(now: now)), now.timeIntervalSince(peer.lastHandshake) >= 5 {
+            if (!peer.wireguard.isEstablished || (peer.wireguard.needsRekey(now: now) && due)), now.timeIntervalSince(peer.lastHandshake) >= 5 {
                 // Clients initiate the first handshake. Either endpoint may rekey established sessions.
                 if server && !peer.wireguard.isEstablished { continue }
                 let handshake = try peer.wireguard.initiateHandshake(now: now)
                 peer.lastHandshake = now; peers[node] = peer
                 startupTrace?.record("wireGuardInitiationSendStarted")
                 try await network.send(to: node, packet: handshake)
-            } else if peer.wireguard.isEstablished, now.timeIntervalSince(peer.lastSend) >= 25 { try await sendPayload(Data(), to: node) }
+            } else if peer.wireguard.isEstablished, due, now.timeIntervalSince(peer.lastSend) >= (idle ? Self.idleKeepalive : 25) { try await sendPayload(Data(), to: node) }
             } catch { if !server { throw error } }
         }
     }

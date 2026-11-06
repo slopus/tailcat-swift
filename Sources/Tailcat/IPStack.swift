@@ -75,6 +75,8 @@ internal actor IPStack {
         var lastActivity = ProcessInfo.processInfo.systemUptime
         var persistSent: TimeInterval = 0
         var finishedAt: TimeInterval?
+        /// The right edge of the window last advertised: the peer may send up to it.
+        var advertisedEdge: UInt32 = 0
 
         init(key: FlowKey, phase: Phase, sequence: UInt32, listener: UUID? = nil) {
             self.key = key
@@ -451,10 +453,23 @@ internal actor IPStack {
             acknowledge(state, acknowledgement)
         }
         if !payload.isEmpty || flags & 1 != 0 {
+            // Data is acknowledged at once: a writer waits for its bytes to be
+            // acknowledged, so a delayed ACK would hold up the peer's next write.
             ingest(state, sequence: sequence, payload: payload, fin: flags & 1 != 0)
             sendACK(state)
         }
         flush(state)
+    }
+
+    /// Whether the window opened enough to tell the peer: by half the buffer,
+    /// or by a segment once the peer has less than two left to send (RFC 1122
+    /// 4.2.3.3). Each read used to send its own update.
+    private func windowUpdateDue(_ state: TCPState) -> Bool {
+        let window = UInt32(receiveWindow(state))
+        let promised = Self.before(state.advertisedEdge, state.receiveNext) ? 0 : state.advertisedEdge &- state.receiveNext
+        guard window > promised else { return false }
+        let opened = window - promised
+        return opened >= UInt32(receiveCapacity / 2) || (promised < UInt32(2 * state.mss) && opened >= UInt32(state.mss))
     }
 
     /// Rejects a transport segment before it enters a listening endpoint.
@@ -602,13 +617,22 @@ internal actor IPStack {
     }
 
     private func retransmit(_ state: TCPState, _ segment: Segment) {
+        let window = receiveWindow(state)
         emit(tcpPacket(state.key, sequence: segment.sequence, ack: state.receiveNext,
-                       flags: segment.flags, window: receiveWindow(state), payload: segment.payload))
+                       flags: segment.flags, window: window, payload: segment.payload))
+        acknowledged(state, window: window)
     }
 
     private func sendACK(_ state: TCPState) {
+        let window = receiveWindow(state)
         emit(tcpPacket(state.key, sequence: state.sendNext, ack: state.receiveNext,
-                       flags: 0x10, window: receiveWindow(state)))
+                       flags: 0x10, window: window))
+        acknowledged(state, window: window)
+    }
+
+    /// A segment just carried RCV.NXT and this window.
+    private func acknowledged(_ state: TCPState, window: UInt16) {
+        state.advertisedEdge = state.receiveNext &+ UInt32(window)
     }
 
     private func flush(_ state: TCPState) {
@@ -641,9 +665,8 @@ internal actor IPStack {
             try Task.checkCancellation()
             return try await withCheckedThrowingContinuation { continuation in
                 state.reads.append(ReadWaiter(id: waiterID, maximum: maximumBytes, continuation: continuation))
-                let previous = receiveWindow(state)
                 satisfyReads(state)
-                if receiveWindow(state) > previous { sendACK(state) }
+                if windowUpdateDue(state) { sendACK(state) }
                 schedule(state)
             }
         } onCancel: { Task { await self.cancelRead(id, waiter: waiterID) } }
@@ -713,8 +736,10 @@ internal actor IPStack {
         let reads = state.reads
         state.reads.removeAll()
         for waiter in reads { waiter.continuation.resume(throwing: TailcatTransportError.closed) }
-        sendACK(state)
+        let sent = state.sendNext
         flush(state)
+        // A FIN this flush let go carries the acknowledgement itself.
+        if state.sendNext == sent { sendACK(state) }
         schedule(state)
     }
 

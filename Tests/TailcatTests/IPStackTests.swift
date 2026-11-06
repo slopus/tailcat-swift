@@ -155,6 +155,32 @@ final class IPStackTests: XCTestCase {
         }
     }
 
+    func testReadingABufferedResponseSendsNoWindowUpdatePerRead() async throws {
+        let (a, b, link) = await pair()
+        let listener = try await b.listen(port: 87)
+        let peer = addressB
+        let response = Data((0..<20_000).map { UInt8(truncatingIfNeeded: $0 * 7) })
+        try await deadline {
+            let client = try await a.connect(peer: peer, port: 87)
+            let server = try await listener.accept()
+            // Returns once the client has acknowledged every byte: all of it is buffered.
+            try await server.write(response)
+            try await server.closeWrite()
+            let before = await link.deliveredACKs
+            var received = Data()
+            while true {
+                let chunk = try await client.read(maximumBytes: 1000)
+                if chunk.isEmpty { break }
+                received.append(chunk)
+            }
+            XCTAssertEqual(received, response)
+            // The window never ran low, so the peer is told nothing it needs.
+            let updates = await link.deliveredACKs - before
+            XCTAssertLessThanOrEqual(updates, 1)
+        }
+        await a.close(); await b.close()
+    }
+
     func testHalfCloseDrainsRequestAndBufferedResponse() async throws {
         let (a, b, _) = await pair()
         let listener = try await b.listen(port: 80)
@@ -349,7 +375,9 @@ final class IPStackTests: XCTestCase {
         let (a, b, link) = await pair()
         let listener = try await b.listen(port: 86)
         let peer = addressB
-        let response = Data((0..<4096).map { UInt8(truncatingIfNeeded: $0 * 19) })
+        // Nearly the whole receive window, so that reading reopens it by more
+        // than a segment while the peer has less than two left to send.
+        let response = Data((0..<64_000).map { UInt8(truncatingIfNeeded: $0 * 19) })
         try await deadline {
             let client = try await a.connect(peer: peer, port: 86)
             let server = try await listener.accept()
@@ -363,18 +391,16 @@ final class IPStackTests: XCTestCase {
             // buffered at the client. Reading reopens the receive window and
             // elicits an exact-sequence RST from the unknown-flow handler.
             await server.abort()
-            let prefix = try await client.read(maximumBytes: 1024)
-            XCTAssertEqual(prefix, Data(response.prefix(1024)))
+            let prefix = try await client.read(maximumBytes: 4096)
+            XCTAssertEqual(prefix, Data(response.prefix(4096)))
             for _ in 0..<100 {
                 if await link.deliveredResets > 0 { break }
                 try await Task.sleep(nanoseconds: 10_000_000)
             }
             let resets = await link.deliveredResets
             XCTAssertEqual(resets, 1)
-            let tail = try await client.read()
-            XCTAssertEqual(tail, Data(response.dropFirst(1024)))
-            let eof = try await client.read()
-            XCTAssertTrue(eof.isEmpty)
+            let tail = try await self.drain(client)
+            XCTAssertEqual(tail, Data(response.dropFirst(4096)))
         }
         await a.close(); await b.close()
     }
