@@ -35,6 +35,8 @@ private actor PacketLink {
 
     func attach(_ a: IPStack, _ b: IPStack) { self.a = a; self.b = b }
 
+    func dropNextData() { faults.dropData = true }
+
     func replayClientFIN() async {
         if let packet = lastClientFIN { await b?.receive(packet) }
     }
@@ -646,6 +648,77 @@ final class IPStackTests: XCTestCase {
         await b.receive(try XCTUnwrap(marker))
         let result = try await deadline { try await receiver.receive() }
         XCTAssertEqual(result.data, Data([4, 5, 6]))
+        await a.close(); await b.close()
+    }
+
+    /// Waits until a stack's timer is disarmed or only due at least `after` seconds out.
+    private func waitForQuietTimer(_ stack: IPStack, after: TimeInterval = .infinity) async throws {
+        for _ in 0..<300 {
+            guard let wake = await stack.scheduledWakeup else { return }
+            if wake - ProcessInfo.processInfo.systemUptime >= after { return }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTFail("Timer stayed armed for a near deadline")
+    }
+
+    func testIdleStackDoesNotTickAndStillRetransmitsAtDeadline() async throws {
+        let (a, b, link) = await pair()
+        let listener = try await b.listen(port: 8080)
+        let peer = addressB
+        try await deadline {
+            let client = try await a.connect(peer: peer, port: 8080)
+            let server = try await listener.accept()
+            try await client.write(Data("hello".utf8))
+            let hello = try await server.read(maximumBytes: 5)
+            XCTAssertEqual(hello, Data("hello".utf8))
+            // Acknowledged handshake and data leave no deadline behind.
+            try await self.waitForQuietTimer(a)
+            try await self.waitForQuietTimer(b)
+            let idleA = await a.wakeups, idleB = await b.wakeups
+            try await Task.sleep(nanoseconds: 1_000_000_000)
+            let laterA = await a.wakeups, laterB = await b.wakeups
+            let armedA = await a.scheduledWakeup, armedB = await b.scheduledWakeup
+            XCTAssertEqual(laterA, idleA)
+            XCTAssertEqual(laterB, idleB)
+            XCTAssertNil(armedA)
+            XCTAssertNil(armedB)
+
+            // A segment lost after the idle period still goes out again at its 500 ms deadline.
+            await link.dropNextData()
+            let payload = Data(repeating: 0x5e, count: 900)
+            let started = ProcessInfo.processInfo.systemUptime
+            let writer = Task { try await client.write(payload) }
+            var received = Data()
+            while received.count < payload.count { received.append(try await server.read()) }
+            let elapsed = ProcessInfo.processInfo.systemUptime - started
+            try await writer.value
+            XCTAssertEqual(received, payload)
+            let drops = await link.drops
+            XCTAssertEqual(drops, 1)
+            XCTAssertGreaterThanOrEqual(elapsed, 0.5)
+            XCTAssertLessThan(elapsed, 1.5)
+        }
+        await a.close(); await b.close()
+    }
+
+    func testClosedFlowSleepsUntilTwoMinuteCleanup() async throws {
+        let (a, b, _) = await pair()
+        let listener = try await b.listen(port: 80)
+        let client = try await a.connect(peer: addressB, port: 80)
+        let server = try await listener.accept()
+        let closedAt = ProcessInfo.processInfo.systemUptime
+        await client.close()
+        let eof = try await deadline { try await server.read() }
+        XCTAssertTrue(eof.isEmpty)
+        await server.close()
+        // Once both FINs are acknowledged, only TIME-WAIT cleanup remains.
+        try await waitForQuietTimer(a, after: 60)
+        let wake = await a.scheduledWakeup
+        let closing = await a.flowStatistics.closing
+        XCTAssertEqual(closing, 1)
+        let delay = try XCTUnwrap(wake) - closedAt
+        XCTAssertGreaterThanOrEqual(delay, 120)
+        XCTAssertLessThan(delay, 125)
         await a.close(); await b.close()
     }
 

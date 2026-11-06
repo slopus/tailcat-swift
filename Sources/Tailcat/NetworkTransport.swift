@@ -282,6 +282,7 @@ public actor NetworkTransport {
     private let privateKey: Data
     private var nodePublicKey: Data?
     private let discoPrivateKey: Data
+    private let discoKeys = DiscoveryKeyCache()
     private let relay: DERPTransport
     private let relayNodes: [DERPNode]
     private let relayFirst: Bool
@@ -540,6 +541,7 @@ public actor NetworkTransport {
     }
 
     public func removePeer(_ nodeKey: Data) {
+        if let discoKey = peers[nodeKey]?.discoKey { discoKeys.remove(discoKey) }
         relayMarkers.removeValue(forKey: nodeKey)?.task?.cancel()
         pendingProbes.remove(nodeKey)
         probeTasks.removeValue(forKey: nodeKey)?.cancel()
@@ -768,7 +770,7 @@ public actor NetworkTransport {
         #if canImport(Network)
         pathMonitor?.cancel(); pathMonitor = nil
         #endif
-        udp?.close(); udp = nil; peers.removeAll(); probes.removeAll(); interfaceEndpoints.removeAll()
+        udp?.close(); udp = nil; peers.removeAll(); discoKeys.removeAll(); probes.removeAll(); interfaceEndpoints.removeAll()
         await relay.close(); continuation.finish()
     }
 
@@ -835,11 +837,11 @@ public actor NetworkTransport {
               relaySource == nil || relaySource == match.key else { return }
         let key = match.key
         let generation = networkGeneration, peerGeneration = match.value.generation
-        let secret = discoPrivateKey
+        let secret = discoPrivateKey, keys = discoKeys
         // Portable NaCl can be costly with many interface candidates. Keep that
         // work off the routing actor so relay/app sends can proceed concurrently.
         let sender = try? await Task.detached(priority: .utility) {
-            try Discovery.open(packet, privateKey: secret)
+            try keys.open(packet, privateKey: secret)
         }.value
         if sender == nil { TransportDiagnostics.log("disco open rejected endpoint=\(endpoint?.description ?? "relay")") }
         guard let sender, !closed, !Task.isCancelled, networkGeneration == generation,
@@ -998,9 +1000,9 @@ public actor NetworkTransport {
     }
 
     private func sealDiscovery(_ message: DiscoveryMessage, to key: Data) async throws -> Data {
-        let secret = discoPrivateKey
+        let secret = discoPrivateKey, keys = discoKeys
         return try await Task.detached(priority: .utility) {
-            try Discovery.seal(message, to: key, privateKey: secret)
+            try keys.seal(message, to: key, privateKey: secret)
         }.value
     }
 

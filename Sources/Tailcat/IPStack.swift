@@ -123,7 +123,15 @@ internal actor IPStack {
     private var terminalOrder: [UUID] = []
     private var nextPort: UInt16 = UInt16.random(in: 49_152...65_535)
     private var closed = false
+    // The timer sleeps until the earliest retransmit, persist, cleanup, or
+    // UDP idle deadline, and is not armed while nothing is pending.
     private var timer: Task<Void, Never>?
+    private var timerToken = 0
+    private var lastTick = -TimeInterval.infinity
+    /// When the armed timer wakes, in system uptime; nil while idle.
+    internal private(set) var scheduledWakeup: TimeInterval?
+    /// Timer wakeups so far, for tests.
+    internal private(set) var wakeups = 0
     private var output: [Data] = []
     private var outputRunning = false
     private let receiveCapacity = 65_535
@@ -144,7 +152,6 @@ internal actor IPStack {
                              phase: .synSent, sequence: UInt32.random(in: .min ... .max))
         connections[state.id] = state
         flows[state.key] = state.id
-        startTimer()
         let id = state.id
         return try await withTaskCancellationHandler {
             return try await withCheckedThrowingContinuation { continuation in
@@ -192,7 +199,7 @@ internal actor IPStack {
         let state = UDPState(port: bound, idleTimeout: idleTimeout)
         udpSockets[state.id] = state
         udpPorts[bound] = state.id
-        startTimer()
+        schedule(deadline(for: state))
         return TailcatUDPSocket(stack: self, id: state.id, port: bound)
     }
 
@@ -200,6 +207,7 @@ internal actor IPStack {
         closed = true
         timer?.cancel()
         timer = nil
+        scheduledWakeup = nil
         for id in Array(connections.keys) + Array(closing.keys) { fail(id, error: TailcatTransportError.closed, reset: true) }
         for id in Array(listeners.keys) { closeListener(id) }
         for id in Array(udpSockets.keys) { closeUDP(id) }
@@ -238,14 +246,51 @@ internal actor IPStack {
         throw TailcatTransportError.addressInUse
     }
 
-    private func startTimer() {
-        guard timer == nil else { return }
+    /// Arms the timer for a deadline unless it already wakes no later.
+    /// Wakeups stay at least 100 ms apart, as with the former fixed tick.
+    private func schedule(_ deadline: TimeInterval?) {
+        guard !closed, let deadline else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        // The slack makes the strict and inclusive checks in tick() pass. A
+        // distant UDP idle timeout wakes hourly and reschedules from there.
+        let wake = min(max(deadline + 0.001, lastTick + 0.1), now + 3600)
+        if let armed = scheduledWakeup, armed <= wake { return }
+        timer?.cancel()
+        timerToken &+= 1
+        scheduledWakeup = wake
+        let token = timerToken
+        let delay = wake - now
         timer = Task { [weak self] in
-            while !Task.isCancelled {
-                do { try await Task.sleep(nanoseconds: 100_000_000) } catch { return }
-                await self?.tick()
+            if delay > 0 {
+                do { try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) } catch { return }
             }
+            await self?.tick(token)
         }
+    }
+
+    private func schedule(_ state: TCPState) {
+        guard connections[state.id] === state || closing[state.id] === state else { return }
+        schedule(deadline(for: state))
+    }
+
+    /// The earliest time tick() has work for this flow, mirroring its checks.
+    private func deadline(for state: TCPState) -> TimeInterval? {
+        if let finished = state.finishedAt {
+            // A read or close that empties the buffer reschedules the flow.
+            return state.buffer.isEmpty ? finished + 120 : nil
+        }
+        var result = state.applicationClosedAt.map { $0 + 120 }
+        if let first = state.segments.first {
+            result = min(result ?? .infinity, first.sent + state.retransmitDelay)
+        }
+        if state.remoteWindow == 0 && (!state.writes.isEmpty || state.writeClosed) {
+            result = min(result ?? .infinity, state.persistSent + 1)
+        }
+        return result
+    }
+
+    private func deadline(for state: UDPState) -> TimeInterval? {
+        state.idleTimeout.map { state.activity + $0 }
     }
 
     private func emit(_ packet: Data) {
@@ -326,7 +371,6 @@ internal actor IPStack {
                 state.mss = parseMSS(body, headerLength: headerLength)
                 connections[state.id] = state
                 flows[key] = state.id
-                startTimer()
                 transmit(state, flags: 0x12)
             } else {
                 reset(key, sequence: sequence, acknowledgement: acknowledgement,
@@ -335,6 +379,7 @@ internal actor IPStack {
             return
         }
         state.lastActivity = ProcessInfo.processInfo.systemUptime
+        defer { schedule(state) }
         if state.phase == .synSent {
             guard flags & 0x10 != 0, acknowledgement == state.sendNext else { return }
             if flags & 0x04 != 0 { fail(id, error: TailcatTransportError.connectionRefused); return }
@@ -553,6 +598,7 @@ internal actor IPStack {
         state.sendNext = segment.end
         state.segments.append(segment)
         retransmit(state, segment)
+        schedule(state)
     }
 
     private func retransmit(_ state: TCPState, _ segment: Segment) {
@@ -598,6 +644,7 @@ internal actor IPStack {
                 let previous = receiveWindow(state)
                 satisfyReads(state)
                 if receiveWindow(state) > previous { sendACK(state) }
+                schedule(state)
             }
         } onCancel: { Task { await self.cancelRead(id, waiter: waiterID) } }
     }
@@ -612,6 +659,7 @@ internal actor IPStack {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                 state.writes.append(WriteWaiter(id: waiterID, data: Data(data), continuation: continuation))
                 flush(state)
+                schedule(state)
             }
         } onCancel: { Task { await self.cancelWrite(id, waiter: waiterID) } }
     }
@@ -627,6 +675,7 @@ internal actor IPStack {
                 state.writeClosed = true
                 state.closeWaiters.append((waiterID, continuation))
                 flush(state)
+                schedule(state)
             }
         } onCancel: { Task { await self.cancelCloseWrite(id, waiter: waiterID) } }
     }
@@ -666,6 +715,7 @@ internal actor IPStack {
         for waiter in reads { waiter.continuation.resume(throwing: TailcatTransportError.closed) }
         sendACK(state)
         flush(state)
+        schedule(state)
     }
 
     internal func abortConnection(_ id: UUID) {
@@ -789,8 +839,14 @@ internal actor IPStack {
         for (_, continuation) in state.waiters { continuation.resume(throwing: error) }
     }
 
-    private func tick() {
+    private func tick(_ token: Int) {
+        // A cancelled sleeper can still reach the actor after being replaced.
+        guard token == timerToken, !closed else { return }
+        timer = nil
+        scheduledWakeup = nil
+        wakeups += 1
         let now = ProcessInfo.processInfo.systemUptime
+        lastTick = now
         for state in Array(connections.values) + Array(closing.values) {
             if let finished = state.finishedAt {
                 // Retain receive buffers and TIME-WAIT state for late FINs.
@@ -826,6 +882,9 @@ internal actor IPStack {
                 closeUDP(state.id, error: TailcatTransportError.timedOut)
             }
         }
+        let next = (Array(connections.values) + Array(closing.values)).compactMap { deadline(for: $0) } +
+            udpSockets.values.compactMap { deadline(for: $0) }
+        schedule(next.min())
     }
 
     private func tcpPacket(_ key: FlowKey, sequence: UInt32, ack: UInt32, flags: UInt8,

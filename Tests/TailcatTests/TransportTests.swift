@@ -55,6 +55,61 @@ final class TransportTests: XCTestCase {
         XCTAssertThrowsError(try Discovery.open(Data("TS💬".utf8), privateKey: receiver))
     }
 
+    func testDiscoveryKeyCacheMatchesFreshBoxesPerPeer() throws {
+        let ours = Data((0..<32).map(UInt8.init)), first = Data((32..<64).map(UInt8.init))
+        let second = Data((64..<96).map(UInt8.init)), replacement = Data((96..<128).map(UInt8.init))
+        let ourPublic = try NaClBox.publicKey(for: ours)
+        let firstPublic = try NaClBox.publicKey(for: first), secondPublic = try NaClBox.publicKey(for: second)
+        let nonce = Data(repeating: 0x3c, count: 24)
+        let message = DiscoveryMessage.ping(transaction: Data(repeating: 7, count: 12), nodeKey: ourPublic)
+        let cache = DiscoveryKeyCache()
+
+        // Cached boxes are byte-identical to boxes built with a fresh agreement.
+        for _ in 0..<3 {
+            let packet = try cache.seal(message, to: firstPublic, privateKey: ours, nonce: nonce)
+            let fresh = Discovery.magic + ourPublic + nonce +
+                (try NaClBox.seal(message.encode(), nonce: nonce, publicKey: firstPublic, privateKey: ours))
+            XCTAssertEqual(packet, fresh)
+            XCTAssertEqual(try Discovery.open(packet, privateKey: first).message, message)
+        }
+        XCTAssertEqual(cache.agreements, 1)
+        XCTAssertEqual(try cache.keys(for: firstPublic, privateKey: ours).shared,
+                       try NaClBox.sharedKey(publicKey: firstPublic, privateKey: ours))
+
+        // Keys are per peer: another peer gets its own entry and its own box.
+        let toSecond = try cache.seal(message, to: secondPublic, privateKey: ours, nonce: nonce)
+        XCTAssertEqual(cache.count, 2)
+        XCTAssertEqual(cache.agreements, 2)
+        XCTAssertNotEqual(try cache.keys(for: secondPublic, privateKey: ours).shared,
+                          try cache.keys(for: firstPublic, privateKey: ours).shared)
+        XCTAssertEqual(try Discovery.open(toSecond, privateKey: second).message, message)
+        XCTAssertThrowsError(try Discovery.open(toSecond, privateKey: first))
+
+        // The open path reuses the sealing entry for that peer.
+        let reply = DiscoveryMessage.pong(transaction: Data(repeating: 7, count: 12),
+                                          observed: try DiscoveryEndpoint("192.0.2.7:41641"))
+        let inbound = try Discovery.seal(reply, to: ourPublic, privateKey: first)
+        let opened = try cache.open(inbound, privateKey: ours)
+        XCTAssertEqual(opened.source, firstPublic)
+        XCTAssertEqual(opened.message, reply)
+        XCTAssertEqual(cache.agreements, 2)
+        var corrupt = inbound; corrupt[corrupt.count - 1] ^= 1
+        XCTAssertThrowsError(try cache.open(corrupt, privateKey: ours))
+
+        cache.remove(secondPublic)
+        XCTAssertEqual(cache.count, 1)
+
+        // A different private key discards every key agreed with the old one.
+        let rekeyed = try cache.seal(message, to: firstPublic, privateKey: replacement, nonce: nonce)
+        XCTAssertEqual(cache.count, 1)
+        XCTAssertEqual(cache.agreements, 3)
+        XCTAssertEqual(Discovery.sourceKey(rekeyed), try NaClBox.publicKey(for: replacement))
+        XCTAssertEqual(try cache.keys(for: firstPublic, privateKey: replacement).shared,
+                       try NaClBox.sharedKey(publicKey: firstPublic, privateKey: replacement))
+        XCTAssertEqual(try Discovery.open(rekeyed, privateKey: first).message, message)
+        XCTAssertThrowsError(try cache.seal(message, to: Data(repeating: 0, count: 31), privateKey: ours))
+    }
+
     func testRFC5769STUNXORMappedAddress() throws {
         // RFC 5769 section 2.2, including padded attributes and MESSAGE-INTEGRITY.
         let response = hex("0101003c2112a442b7e7a701bc34d686fa87dfae8022000b7465737420766563746f7220002000080001a147e112a643000800149aeaa70cbfd8cb56781ef2b5b2d3f249c1b571a280280004c07d4c96")

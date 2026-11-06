@@ -15,15 +15,24 @@ public enum TransportError: Error, Equatable, Sendable {
 /// The NaCl crypto_box wire format: a 16-byte authenticator followed by ciphertext.
 public enum NaClBox {
     public static func seal(_ message: Data, nonce: Data, publicKey: Data, privateKey: Data) throws -> Data {
-        let key = try sharedKey(publicKey: publicKey, privateKey: privateKey)
+        try seal(message, nonce: nonce, sharedKey: sharedKey(publicKey: publicKey, privateKey: privateKey))
+    }
+
+    public static func open(_ message: Data, nonce: Data, publicKey: Data, privateKey: Data) throws -> Data {
+        guard message.count >= 16 else { throw TransportError.authenticationFailed }
+        return try open(message, nonce: nonce, sharedKey: sharedKey(publicKey: publicKey, privateKey: privateKey))
+    }
+
+    /// Seals with a key from sharedKey(publicKey:privateKey:), skipping the key agreement.
+    static func seal(_ message: Data, nonce: Data, sharedKey key: [UInt8]) throws -> Data {
         let stream = try salsaStream(key: key, nonce: nonce, count: message.count + 32)
         let encrypted = Data(zip(message, stream.dropFirst(32)).map { $0 ^ $1 })
         return poly1305(encrypted, key: Array(stream.prefix(32))) + encrypted
     }
 
-    public static func open(_ message: Data, nonce: Data, publicKey: Data, privateKey: Data) throws -> Data {
+    /// Opens with a key from sharedKey(publicKey:privateKey:), skipping the key agreement.
+    static func open(_ message: Data, nonce: Data, sharedKey key: [UInt8]) throws -> Data {
         guard message.count >= 16 else { throw TransportError.authenticationFailed }
-        let key = try sharedKey(publicKey: publicKey, privateKey: privateKey)
         let stream = try salsaStream(key: key, nonce: nonce, count: message.count - 16 + 32)
         let ciphertext = Data(message.dropFirst(16))
         let tag = poly1305(ciphertext, key: Array(stream.prefix(32)))
@@ -43,7 +52,8 @@ public enum NaClBox {
         return Data((0..<count).map { _ in UInt8.random(in: .min ... .max, using: &generator) })
     }
 
-    private static func sharedKey(publicKey: Data, privateKey: Data) throws -> [UInt8] {
+    /// The crypto_box_beforenm key: a Curve25519 agreement hashed with HSalsa20.
+    static func sharedKey(publicKey: Data, privateKey: Data) throws -> [UInt8] {
         guard publicKey.count == 32, privateKey.count == 32 else { throw TransportError.invalidKey }
         let secret = try TailcatCrypto.sharedSecret(privateKey: privateKey, publicKey: publicKey)
         return hsalsa(key: Array(secret), nonce: [UInt8](repeating: 0, count: 16))
@@ -233,11 +243,68 @@ public enum Discovery {
             (try NaClBox.seal(message.encode(), nonce: nonce, publicKey: key, privateKey: privateKey))
     }
     public static func open(_ packet: Data, privateKey: Data) throws -> (source: Data, message: DiscoveryMessage) {
+        try open(packet) { try NaClBox.sharedKey(publicKey: $0, privateKey: privateKey) }
+    }
+    static func seal(_ message: DiscoveryMessage, from publicKey: Data, sharedKey: [UInt8], nonce: Data) throws -> Data {
+        magic + publicKey + nonce + (try NaClBox.seal(message.encode(), nonce: nonce, sharedKey: sharedKey))
+    }
+    static func open(_ packet: Data, sharedKey: (Data) throws -> [UInt8]) throws -> (source: Data, message: DiscoveryMessage) {
         let b = Array(packet)
         guard packet.starts(with: magic), b.count >= 78 else { throw TransportError.malformedPacket }
         let key = Data(b[6..<38])
-        let payload = try NaClBox.open(Data(b[62...]), nonce: Data(b[38..<62]), publicKey: key, privateKey: privateKey)
+        let payload = try NaClBox.open(Data(b[62...]), nonce: Data(b[38..<62]), sharedKey: sharedKey(key))
         return (key, try DiscoveryMessage(encoded: payload))
+    }
+}
+
+/// Precomputed NaCl box keys for disco peers. Each seal or open would otherwise
+/// repeat a Curve25519 agreement that only changes with our disco private key.
+final class DiscoveryKeyCache: @unchecked Sendable {
+    static let capacity = 1024
+    private let lock = NSLock()
+    private var privateKey = Data()
+    private var publicKey = Data()
+    private var sharedKeys = [Data: [UInt8]]()
+    private var agreementCount = 0
+
+    var count: Int { lock.lock(); defer { lock.unlock() }; return sharedKeys.count }
+    /// Key agreements computed so far, for tests.
+    var agreements: Int { lock.lock(); defer { lock.unlock() }; return agreementCount }
+
+    func seal(_ message: DiscoveryMessage, to key: Data, privateKey: Data, nonce: Data = NaClBox.random(24)) throws -> Data {
+        let keys = try self.keys(for: key, privateKey: privateKey)
+        return try Discovery.seal(message, from: keys.publicKey, sharedKey: keys.shared, nonce: nonce)
+    }
+
+    func open(_ packet: Data, privateKey: Data) throws -> (source: Data, message: DiscoveryMessage) {
+        try Discovery.open(packet) { try keys(for: $0, privateKey: privateKey).shared }
+    }
+
+    func remove(_ key: Data) { lock.lock(); sharedKeys.removeValue(forKey: key); lock.unlock() }
+
+    func removeAll() { lock.lock(); sharedKeys.removeAll(); lock.unlock() }
+
+    func keys(for peer: Data, privateKey: Data) throws -> (publicKey: Data, shared: [UInt8]) {
+        lock.lock()
+        let current = TailcatCrypto.constantTimeEqual(self.privateKey, privateKey)
+        let ours = current ? publicKey : nil
+        let cached = current ? sharedKeys[peer] : nil
+        lock.unlock()
+        if let ours, let cached { return (ours, cached) }
+        // Agreements run outside the lock so concurrent peers do not serialize.
+        let publicKey = try ours ?? NaClBox.publicKey(for: privateKey)
+        let shared = try NaClBox.sharedKey(publicKey: peer, privateKey: privateKey)
+        lock.lock()
+        agreementCount += 1
+        if !TailcatCrypto.constantTimeEqual(self.privateKey, privateKey) {
+            self.privateKey = privateKey
+            self.publicKey = publicKey
+            sharedKeys.removeAll()
+        }
+        if sharedKeys.count >= Self.capacity { sharedKeys.removeAll() }
+        sharedKeys[peer] = shared
+        lock.unlock()
+        return (publicKey, shared)
     }
 }
 
