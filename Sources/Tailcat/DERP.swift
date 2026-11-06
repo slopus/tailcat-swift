@@ -37,12 +37,13 @@ enum DERPFrame {
 private final class DERPStream: @unchecked Sendable {
     let connection: NWConnection
     private let verifiesTLS: Bool
+    private let fastStartCapture = FastStartKeyCapture()
     private let queue = DispatchQueue(label: "tailcat.derp")
     private let lock = NSLock()
     private var readyContinuation: CheckedContinuation<Void, Error>?
     private var timeoutWork: DispatchWorkItem?
 
-    init(node: DERPNode) throws {
+    init(node: DERPNode, fastStart: Bool) throws {
         verifiesTLS = !node.insecureForTests
         let port = node.derpPort > 0 ? node.derpPort : 443
         guard let nwPort = NWEndpoint.Port(rawValue: UInt16(exactly: port) ?? 0), nwPort.rawValue != 0,
@@ -51,13 +52,23 @@ private final class DERPStream: @unchecked Sendable {
         node.hostName.withCString { sec_protocol_options_set_tls_server_name(tls.securityProtocolOptions, $0) }
         if node.insecureForTests {
             sec_protocol_options_set_verify_block(tls.securityProtocolOptions, { _, _, complete in complete(true) }, .global(qos: .utility))
-        } else if !node.certName.isEmpty, node.certName != node.hostName {
-            let expectedName = node.certName
-            sec_protocol_options_set_verify_block(tls.securityProtocolOptions, { _, trust, complete in
+        } else if fastStart || (!node.certName.isEmpty && node.certName != node.hostName) {
+            let expectedName = node.certName.isEmpty ? node.hostName : node.certName
+            let capture = fastStart ? fastStartCapture : nil
+            if fastStart {
+                // A resumed session sends no certificates, so it could never
+                // carry the key; a full handshake always does.
+                sec_protocol_options_set_tls_resumption_enabled(tls.securityProtocolOptions, false)
+            }
+            sec_protocol_options_set_verify_block(tls.securityProtocolOptions, { metadata, trust, complete in
                 let certificateTrust = sec_trust_copy_ref(trust).takeRetainedValue()
                 let policy = SecPolicyCreateSSL(true, expectedName as CFString)
-                guard SecTrustSetPolicies(certificateTrust, policy) == errSecSuccess else { complete(false); return }
-                complete(SecTrustEvaluateWithError(certificateTrust, nil))
+                guard SecTrustSetPolicies(certificateTrust, policy) == errSecSuccess,
+                      SecTrustEvaluateWithError(certificateTrust, nil) else { complete(false); return }
+                // The handshake is paused until complete(), so this is the one
+                // point where the peer chain cannot change underneath the read.
+                capture?.store(DERPStream.peerFastStartKey(metadata))
+                complete(true)
             }, .global(qos: .utility))
         }
         let host = !node.ipv4.isEmpty && node.ipv4 != "none" ? node.ipv4 :
@@ -108,25 +119,39 @@ private final class DERPStream: @unchecked Sendable {
     }
     func close() { connection.cancel() }
 
-    /// Read the actual peer certificates from this verified TLS 1.3 handshake,
-    /// not a reconstructed trust chain or a key remembered from another client.
+    /// The key from the actual peer certificates of this verified TLS 1.3
+    /// handshake, not a reconstructed trust chain or a key remembered from
+    /// another client. Nil selects the ordinary DERP handshake.
     func fastStartServerKey() -> Data? {
-        guard verifiesTLS,
+        guard verifiesTLS, let key = fastStartCapture.key,
               let metadata = connection.metadata(definition: NWProtocolTLS.definition) as? NWProtocolTLS.Metadata,
               sec_protocol_metadata_get_negotiated_tls_protocol_version(metadata.securityProtocolMetadata) == .TLSv13 else { return nil }
-        var key: Data?, ambiguous = false
-        let available = sec_protocol_metadata_access_peer_certificate_chain(metadata.securityProtocolMetadata) { value in
+        return key
+    }
+
+    /// Only valid inside the verify block. After the handshake completes the
+    /// TLS stack keeps updating this metadata on its own queue, and walking the
+    /// peer chain then can race with it (an XPC API-misuse trap).
+    private static func peerFastStartKey(_ metadata: sec_protocol_metadata_t) -> Data? {
+        var certificates = [(commonName: String, serialNumber: Data)]()
+        _ = sec_protocol_metadata_access_peer_certificate_chain(metadata) { value in
             let certificate = sec_certificate_copy_ref(value).takeRetainedValue()
             var name: CFString?
             guard SecCertificateCopyCommonName(certificate, &name) == errSecSuccess,
                   let commonName = name as String?,
-                  let serial = SecCertificateCopySerialNumberData(certificate, nil) as Data?,
-                  let candidate = DERPHandshake.metadataServerKey(commonName: commonName, serialNumber: serial) else { return }
-            if key != nil { ambiguous = true }
-            key = candidate
+                  let serial = SecCertificateCopySerialNumberData(certificate, nil) as Data? else { return }
+            certificates.append((commonName, serial))
         }
-        return available && !ambiguous ? key : nil
+        return DERPHandshake.fastStartKey(peerCertificates: certificates)
     }
+}
+
+/// The verify block runs on a TLS queue; the transport reads after `.ready`.
+private final class FastStartKeyCapture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Data?
+    var key: Data? { lock.lock(); defer { lock.unlock() }; return value }
+    func store(_ key: Data?) { lock.lock(); value = key; lock.unlock() }
 }
 #else
 /// Loopback-only plaintext backend for protocol integration tests on Linux.
@@ -136,7 +161,7 @@ private final class DERPStream: @unchecked Sendable {
     private let remote: Data
     private let writeQueue = DispatchQueue(label: "tailcat.derp.test.write")
     private let readQueue = DispatchQueue(label: "tailcat.derp.test.read")
-    init(node: DERPNode) throws {
+    init(node: DERPNode, fastStart: Bool) throws {
         let host = node.ipv4.isEmpty ? node.hostName : node.ipv4
         guard node.insecureForTests, ["127.0.0.1", "::1", "localhost"].contains(host) else {
             throw TransportError.connectionFailed("Production DERP TLS requires Network.framework on an Apple platform")
@@ -405,7 +430,7 @@ public actor DERPTransport {
 
     private func establish(node: DERPNode, allowFastStart: Bool) async throws {
         guard privateKey.count == 32 else { throw TransportError.invalidKey }
-        let connection = try DERPStream(node: node)
+        let connection = try DERPStream(node: node, fastStart: allowFastStart)
         let id = UUID(); generation = id
         startupTrace?.record("relayConnectionCreated", detail: id.uuidString)
         stream = connection; incoming = Data()

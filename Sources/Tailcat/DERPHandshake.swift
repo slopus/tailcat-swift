@@ -14,6 +14,12 @@ enum DERPHandshake {
         return key
     }
 
+    /// Exactly one metadata key in the peer chain, or nil (none or ambiguous).
+    static func fastStartKey(peerCertificates: [(commonName: String, serialNumber: Data)]) -> Data? {
+        let keys = peerCertificates.compactMap { metadataServerKey(commonName: $0.commonName, serialNumber: $0.serialNumber) }
+        return keys.count == 1 ? keys[0] : nil
+    }
+
     static func serverKey(greeting: Data, expected: Data? = nil) throws -> Data {
         guard greeting.count >= 40, greeting.count <= 1024,
               greeting.prefix(8) == Data("DERP🔑".utf8) else { throw TransportError.malformedPacket }

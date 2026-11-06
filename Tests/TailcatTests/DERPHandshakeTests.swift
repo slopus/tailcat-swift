@@ -15,6 +15,17 @@ final class DERPHandshakeTests: XCTestCase {
         }
     }
 
+    func testFastStartKeyNeedsExactlyOneMetadataCertificate() throws {
+        let key = try NaClBox.publicKey(for: NaClBox.random(32)), other = try NaClBox.publicKey(for: NaClBox.random(32))
+        let leaf = (commonName: "derp1.tailscale.com", serialNumber: Data([3, 1, 4]))
+        let meta = (commonName: "derpkey" + key.tailcatHex, serialNumber: Data([2]))
+        XCTAssertEqual(DERPHandshake.fastStartKey(peerCertificates: [leaf, meta]), key)
+        XCTAssertNil(DERPHandshake.fastStartKey(peerCertificates: []))
+        XCTAssertNil(DERPHandshake.fastStartKey(peerCertificates: [leaf]))
+        XCTAssertNil(DERPHandshake.fastStartKey(peerCertificates: [leaf, meta, meta]))
+        XCTAssertNil(DERPHandshake.fastStartKey(peerCertificates: [meta, ("derpkey" + other.tailcatHex, Data([2]))]))
+    }
+
     func testGreetingChecksMagicBoundsAndMetadataKey() throws {
         let key = NaClBox.random(32), greeting = Data("DERP🔑".utf8) + key
         XCTAssertEqual(try DERPHandshake.serverKey(greeting: greeting, expected: key), key)
@@ -53,6 +64,24 @@ final class DERPHandshakeTests: XCTestCase {
         XCTAssertTrue(names.contains("serverInfoVerified"))
         XCTAssertFalse(names.contains("derpFastStartFallback"))
         XCTAssertLessThan(try XCTUnwrap(names.firstIndex(of: "clientInfoWritten")), try XCTUnwrap(names.firstIndex(of: "httpUpgradeAndGreetingReceived")))
+        await transport.close()
+    }
+
+    func testUnreadableFastStartKeyUsesOrdinaryHandshake() async throws {
+        // The loopback stream, like a TLS handshake whose certificates could
+        // not be read, reports no key: the first attempt is already ordinary.
+        let fixture = try LocalRelay()
+        defer { fixture.close() }
+        let trace = StartupTrace()
+        let transport = DERPTransport(nodes: [fixture.node], privateKey: NaClBox.random(32), startupTrace: trace)
+        do { try await transport.connect() } catch { await transport.close(); throw error }
+        let names = trace.snapshot().map(\.name)
+        XCTAssertEqual(fixture.fastStartCount, 0)
+        XCTAssertEqual(names.filter { $0 == "relayConnectionCreated" }.count, 1)
+        XCTAssertFalse(names.contains("derpFastStartSelected"))
+        XCTAssertFalse(names.contains("derpFastStartFallback"))
+        XCTAssertTrue(names.contains("serverInfoVerified"))
+        XCTAssertLessThan(try XCTUnwrap(names.firstIndex(of: "httpUpgradeAndGreetingReceived")), try XCTUnwrap(names.firstIndex(of: "clientInfoWritten")))
         await transport.close()
     }
 

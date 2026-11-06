@@ -132,7 +132,9 @@ Do not supply the same private key to concurrently independent clients: their re
 identities would collide. There is no traffic pooling or shared encryption state.
 Where a verified TLS 1.3 relay
 advertises DERP fast start, the new socket sends its HTTP upgrade and fresh ClientInfo
-together, removing a handshake round trip. Older relays use the ordinary upgrade;
+together, removing a handshake round trip. The relay key is read from the peer certificates
+while the TLS handshake waits for verification, so fast-start sockets skip TLS session
+resumption (a resumed session carries no certificates). Older relays use the ordinary upgrade;
 a failed fast-start attempt retries once on a fresh ordinary socket and disables fast
 start for that transport. Client completion is signalled by authenticated WireGuard
 establishment, without a 100 ms polling delay. These changes need no new public option
