@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 import Foundation
 
+// Connection startup and recovery benchmarks: https://github.com/slopus/tailcat-gym
+
 /// A server embedded in your app. Start it, share its address, and accept byte streams.
 public actor TailcatServer {
     public struct Configuration: Sendable {

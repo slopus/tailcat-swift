@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 import Foundation
 
+// TCP latency and throughput benchmarks: https://github.com/slopus/tailcat-gym
+
 /// A bounded IPv6 TCP/UDP stack. All transport state is isolated on this actor;
 /// the supplied packet writer is the only interface to the encrypted tunnel.
 internal actor IPStack {
