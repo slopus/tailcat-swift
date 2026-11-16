@@ -311,7 +311,21 @@ final class DiscoveryKeyCache: @unchecked Sendable {
 public enum STUN {
     public static func request(transaction: Data) throws -> Data {
         guard transaction.count == 12 else { throw TransportError.malformedPacket }
-        return Data([0,1,0,0,0x21,0x12,0xa4,0x42]) + transaction
+        // Tailscale's STUN servers require their SOFTWARE identifier and a
+        // FINGERPRINT; a bare RFC 5389 binding request is silently dropped.
+        var packet = Data([0,1,0,20,0x21,0x12,0xa4,0x42]) + transaction
+        packet += Data([0x80,0x22,0,8]) + Data("tailnode".utf8)
+        // RFC 5389 section 15.5: CRC-32 of the message before FINGERPRINT,
+        // with the header's length already including that final attribute.
+        var crc: UInt32 = 0xffff_ffff
+        for byte in packet {
+            crc ^= UInt32(byte)
+            for _ in 0..<8 { crc = (crc >> 1) ^ (crc & 1 == 0 ? 0 : 0xedb8_8320) }
+        }
+        let fingerprint = (crc ^ 0xffff_ffff) ^ 0x5354_554e
+        packet += Data([0x80,0x28,0,4])
+        packet += Data([24,16,8,0].map { UInt8(truncatingIfNeeded: fingerprint >> $0) })
+        return packet
     }
     public static func response(_ packet: Data, transaction: Data) throws -> DiscoveryEndpoint {
         let b = Array(packet)
